@@ -1,0 +1,4 @@
+paddleocr==3.3.2
+pypdfium2==4.30.0
+opencv-contrib-python==4.10.0.84
+numpy==1.26.4

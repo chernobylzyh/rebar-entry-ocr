@@ -1,0 +1,54 @@
+"""页头OCR路由：只自动接收当前已支持版式的明确标题与表头组合。"""
+import re
+import unicodedata
+from difflib import SequenceMatcher
+
+TITLE = "材料构配件进场检验记录"
+HEADERS = ["序号", "规格", "进场", "数量", "生产厂家", "合格证号", "检验项目", "检验结果"]
+OTHER_TITLES = ["质量证明书", "质量证明", "送货单", "报审表", "产品合格证"]
+
+
+def normalize(text):
+    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", text))
+
+
+def classify_header(blocks, crop_height):
+    usable = [b for b in blocks if b["text"].strip()]
+    all_text = "".join(normalize(b["text"]) for b in usable)
+    # 裁剪为页上方40%；标题要求位于裁剪区前45%，对应整页前18%。
+    top = [b for b in usable if sum(p[1] for p in b["poly_crop"])/len(b["poly_crop"]) < crop_height*.45]
+    top.sort(key=lambda b: (min(p[1] for p in b["poly_crop"]),min(p[0] for p in b["poly_crop"])))
+    candidates = []
+    # 允许标题被拆为最多3个相邻文字块；不跨整页任意拼关键词。
+    for i in range(len(top)):
+        for length in range(1, 4):
+            chunk = top[i:i+length]
+            if len(chunk) != length:
+                continue
+            text = "".join(normalize(b["text"]) for b in chunk)
+            similarity = SequenceMatcher(None, TITLE, text).ratio()
+            candidates.append((TITLE in text, similarity, min(b["score"] for b in chunk), text))
+    hits = [h for h in HEADERS if h in all_text]
+    exact = [x for x in candidates if x[0] and x[2] >= .90]
+    reasons = []
+    other_title = any(t in "".join(normalize(b["text"]) for b in top if b["score"] >= .90)
+                      for t in OTHER_TITLES)
+    possible_title = any(x[0] or x[1] >= .72 for x in candidates)
+    if other_title and possible_title:
+        decision = "review"
+        reasons = ["conflicting_document_titles"]
+    elif exact and len(hits) >= 5:
+        decision = "target"
+        reasons = ["supported_title_in_header", "at_least_five_column_labels"]
+    elif other_title:
+        decision = "other"
+        reasons = ["another_document_title"]
+    elif possible_title or "进场" in all_text or len(hits) >= 4:
+        decision = "review"
+        reasons = ["possible_entry_form_but_insufficient_evidence"]
+    else:
+        decision = "review"
+        reasons = ["unknown_or_poor_ocr_or_rotated_page"]
+    return {"decision": decision, "reasons": reasons, "header_hits": hits,
+            "ocr_text": "\n".join(b["text"] for b in usable),
+            "best_title_candidate": max(candidates,key=lambda x:(x[0],x[1]))[3] if candidates else ""}
