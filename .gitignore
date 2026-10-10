@@ -1,0 +1,26 @@
+# OCR/model outputs and local regression artifacts
+runs/
+__pycache__/
+data/
+*.egg-info/
+build/
+dist/
+.venv/
+*.py[cod]
+.paddlex/
+
+# Business scans are local inputs, never repository fixtures
+*.pdf
+/钢筋报审文件/
+# Development records, tools and historical handoffs stay local
+/experiments/
+/tools/
+/tests/
+/docs/history/
+/docs/MIGRATION.md
+
+# Local model manifests and weights; the app creates its cache when needed
+/models/
+
+# Local ledger-format reference
+/报审表字文字内容提取项目说明.docx
