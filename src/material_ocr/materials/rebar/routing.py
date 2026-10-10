@@ -52,3 +52,25 @@ def classify_header(blocks, crop_height):
     return {"decision": decision, "reasons": reasons, "header_hits": hits,
             "ocr_text": "\n".join(b["text"] for b in usable),
             "best_title_candidate": max(candidates,key=lambda x:(x[0],x[1]))[3] if candidates else ""}
+
+def classify_page_header(blocks, crop_height):
+    """保留进场表旧接口；新增报审表标题 + 正文锚点联合判定。"""
+    result = classify_header(blocks, crop_height)
+    top = sorted((b for b in blocks if b['score'] >= .90 and
+                  sum(p[1] for p in b['poly_crop']) / len(b['poly_crop']) < crop_height * .45),
+                 key=lambda b: (min(p[1] for p in b['poly_crop']), min(p[0] for p in b['poly_crop'])))
+    titles = ['工程材料构配件设备报审表', '工程材料构配件或设备报审表', '工程材料设备报审表']
+    title_text = ''.join(normalize(b['text']) for b in top)
+    has_title = any(t in title_text for t in titles)
+    text = ''.join(normalize(b['text']) for b in blocks if b['score'] >= .85)
+    anchors = [a for a in ('工程名称', '进场', '拟用于工程', '部位', '经我方检验') if a in text]
+    if has_title and (TITLE in title_text or result['decision'] == 'target'):
+        result.update(decision='review', reasons=['conflicting_document_titles'])
+    elif has_title:
+        if len(anchors) >= 3 and '进场' in anchors and '部位' in anchors:
+            result.update(decision='submission', reasons=['submission_title_and_body_anchors'])
+        else:
+            result.update(decision='review', reasons=['submission_title_but_missing_body_anchors'])
+    result['document_type'] = {'target': 'inspection_record', 'submission': 'approval_form'}.get(result['decision'], 'unknown')
+    result['submission_anchor_hits'] = anchors if has_title else []
+    return result
