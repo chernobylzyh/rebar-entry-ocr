@@ -11,7 +11,9 @@ import cv2
 import numpy as np
 
 from material_ocr.extraction.table import create_ocr, digest, extract, ocr_cell, preview, read_json, render, write_json
-from material_ocr.materials.rebar.routing import classify_header
+from material_ocr.materials.rebar.routing import classify_page_header as classify_header
+from material_ocr.materials.rebar.submission import preview_submission, extract_submission
+from material_ocr.materials.rebar.submission_duplicates import submission_duplicate_candidates
 from material_ocr.ocr.orientation import create_orientation, predict_orientation, rotate_page
 from material_ocr.paths import rebar_config
 
@@ -102,9 +104,9 @@ def run(args, *, progress=None):
                     attempt = {"dpi":args.scan_dpi,"rotation_ccw":rotation,"header_image":str(path.relative_to(out)),**result}
                     entry['attempts'].append(attempt)
                     attempts.append(attempt)
-                    if result['decision'] != 'review' and (score >= .90 or result['decision']=='target'):
+                    if result['decision'] != 'review' and (score >= .90 or result['decision'] in ('target','submission')):
                         break
-                targets = [a for a in attempts if a['decision']=='target']
+                targets = [a for a in attempts if a['decision'] in ('target','submission')]
                 others = [a for a in attempts if a['decision']=='other']
                 decisive = targets or others
                 if decisive:
@@ -133,8 +135,9 @@ def run(args, *, progress=None):
     finally:
         pdf.close()
     records = []
+    submissions = []
     for entry in manifest["pages"]:
-        if entry["decision"] != "target":
+        if entry["decision"] not in ("target", "submission"):
             continue
         page_no = entry["page_no"]
         original = out/"pages"/f"page_{page_no:03d}"
@@ -142,6 +145,23 @@ def run(args, *, progress=None):
         entry["run_dir"] = str(original.relative_to(out))
         try:
             render(SimpleNamespace(pdf=str(pdf_path),page=page_no,dpi=300,out=str(original)))
+            if entry['decision'] == 'submission':
+                submission_template = getattr(args, 'submission_template', rebar_config('submission_b06.json'))
+                preview_submission(original, submission_template, entry.get('rotation_ccw', 0))
+                if args.extract_draft:
+                    result = extract_submission(original, args.device, engine)
+                    entry['result_path'] = str((original/'submission_ocr'/'result.json').relative_to(out))
+                    entry['extraction_status'] = 'draft_ready_pending_review'
+                    entry['summary'] = {'fields':4, 'issues':result['issues']}
+                    submissions.append({**result, 'source_result':entry['result_path']})
+                else:
+                    entry['extraction_status'] = 'preview_ready'
+                write_json(out/'page_index.json', manifest)
+                if progress:
+                    done = sum('extraction_status' in p for p in manifest['pages'] if p['decision'] in ('target','submission'))
+                    total = sum(p['decision'] in ('target','submission') for p in manifest['pages'])
+                    progress('extract', done, total, f'报审与检验表提取 {done}/{total}')
+                continue
             entry['template_attempts'] = []
             geometry = None
             for template in templates:
@@ -187,32 +207,42 @@ def run(args, *, progress=None):
             entry.update({"extraction_status":"error","extraction_error":str(exc)})
         write_json(out/"page_index.json",manifest)
         if progress:
-            done = sum('extraction_status' in p for p in manifest['pages'] if p['decision'] == 'target')
-            total = sum(p['decision'] == 'target' for p in manifest['pages'])
-            progress('extract', done, total, f'检验表提取 {done}/{total}')
+            done = sum('extraction_status' in p for p in manifest['pages'] if p['decision'] in ('target','submission'))
+            total = sum(p['decision'] in ('target','submission') for p in manifest['pages'])
+            progress('extract', done, total, f'报审与检验表提取 {done}/{total}')
     manifest["target_pages"] = [p["page_no"] for p in manifest["pages"] if p["decision"]=="target"]
+    manifest['submission_pages'] = [p['page_no'] for p in manifest['pages'] if p['decision']=='submission']
     manifest["review_pages"] = [p["page_no"] for p in manifest["pages"] if p["decision"] in ("review","error")]
     write_json(out/"page_index.json",manifest)
-    merged = {"schema_version":"v6","pdf_sha256":pdf_sha,"records":records,
+    submission_duplicates = submission_duplicate_candidates(submissions)
+    merged = {"schema_version":"v7","pdf_sha256":pdf_sha,"records":records,
+              'submission_forms':submissions, 'submission_duplicate_candidates':submission_duplicates,
               "duplicate_candidates":duplicate_candidates(records),
               "review_pages":manifest["review_pages"],"ready_for_search":False,
               "note":"草稿未人工复核；重复候选不合计、不自动删除；查看page_index中的全部失败项"}
     write_json(out/"records_all_pages.json",merged)
+    write_json(out/'submission_forms.json',{'schema_version':'submission_v1','pdf_sha256':pdf_sha,
+        'forms':submissions,'submission_pages':manifest['submission_pages'],'duplicate_candidates':submission_duplicates,
+        'failures':[p for p in manifest['pages'] if p['decision']=='submission' and p.get('extraction_error')],
+        'review_pages':manifest['review_pages'],'ready_for_search':False})
     rows=[]
     for entry in manifest["pages"]:
         thumbnails=''.join(f'<a href="{a["header_image"]}"><img src="{a["header_image"]}" width="360"></a>' for a in entry["attempts"])
         links=''
         if "run_dir" in entry:
-            links+=f'<a href="{entry["run_dir"]}/grid_preview.png">几何预览</a>'
+            preview_name = 'submission_page_preview.png' if entry['decision']=='submission' else 'grid_preview.png'
+            links+=f'<a href="{entry["run_dir"]}/{preview_name}">几何预览</a>'
         if "result_path" in entry:
-            links+=f' | <a href="{entry["run_dir"]}/ocr_draft/review.html">逐格核对</a>'
+            review_dir = 'submission_ocr' if entry['decision']=='submission' else 'ocr_draft'
+            links+=f' | <a href="{entry["run_dir"]}/{review_dir}/review.html">字段核对</a>'
         reasons=entry.get("reasons",[]) + [entry.get("extraction_status", ""),entry.get("extraction_error", ""),entry.get("error", "")]
         rows.append(f'<tr><td>{entry["page_no"]}</td><td>{html.escape(entry["decision"])}</td><td>{thumbnails}</td><td>{html.escape(str(reasons))}<br>{links}</td></tr>')
     (out/"index.html").write_text('<!doctype html><meta charset="utf-8"><title>整份PDF进场表筛选</title>'
         '<style>body{font-family:sans-serif;padding:24px}td,th{border:1px solid #ccc;padding:12px;vertical-align:top}table{border-collapse:collapse}</style>'
-        '<h1>页面筛选与提取草稿</h1><p>target=标题及表头命中；other=其他明确标题；review/error必须复核。命中不保证模板适用，草稿不自动放行。</p>'
+        '<h1>页面筛选与提取草稿</h1><p>target=进场检验表；submission=报审表；other=其他明确标题；review/error必须复核。命中不保证模板适用，草稿不自动放行。</p>'
+        f'<h2>报审表重复候选：{len(submission_duplicates)}组</h2><pre>{html.escape(str(submission_duplicates))}</pre>'
         '<table><tr><th>页码</th><th>判定</th><th>OCR页头证据</th><th>状态与链接</th></tr>'+''.join(rows)+'</table>',encoding="utf-8")
-    print(f"target_pages={manifest['target_pages']}; review_pages={manifest['review_pages']}")
+    print(f"target_pages={manifest['target_pages']}; submission_pages={manifest['submission_pages']}; review_pages={manifest['review_pages']}")
     print(f"查看 {out/'index.html'} 与 {out/'page_index.json'}")
     return merged
 
@@ -222,6 +252,7 @@ if __name__ == "__main__":
     parser.add_argument("--pdf",required=True)
     parser.add_argument("--out",required=True)
     parser.add_argument("--template",default=str(rebar_config('inspection_11_rows.json')))
+    parser.add_argument('--submission-template',default=str(rebar_config('submission_b06.json')))
     parser.add_argument("--device",default="gpu:0")
     parser.add_argument("--scan-dpi",type=int,default=180,choices=[150,180,200])
     parser.add_argument("--extract-draft",action="store_true",help="几何检查通过后自动OCR草稿，仍标记未人工确认")

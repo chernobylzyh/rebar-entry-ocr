@@ -6,6 +6,8 @@
 
 [完整流程](docs/WORKFLOW.md) · [网页操作](docs/WEB_USAGE.md) · [代码地图](docs/CODE_MAP.md) · [GitHub 提交说明](docs/GITHUB_SUBMISSION.md)
 
+新增固定版式报审表四字段提取及重复候选，接入现有网页台账，详见 [报审表更新说明](docs/SUBMISSION_UPDATE.md)。第一阶段汇总新增 submission_forms / submission_duplicate_candidates；原进场表记录接口保持 records。
+
 ## 安装和启动
 
 在仓库根目录，使用现有 `ocr` conda 环境：

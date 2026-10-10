@@ -223,7 +223,10 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
                   records=args.records, index=args.index)
     from material_ocr.materials.rebar.filling import build_filling_profile
     def enrich(result):
-        result['filling_profile'] = build_filling_profile(result, index, classification)
+        result['submission_duplicate_candidates'] = deepcopy(records.get('submission_duplicate_candidates', []))
+        result['filling_profile'] = build_filling_profile(result, index, classification,
+            submission_forms=records.get('submission_forms', []),
+            submission_duplicates=records.get('submission_duplicate_candidates', []))
     return build(args.output, inputs=inputs, pdf=args.pdf, base=args.index.parent,
                  matcher=rematch, matching_options=matching_options, result_enricher=enrich)
 
