@@ -1,7 +1,8 @@
 """Rebar ledger fields from the selected physical plate, delivery row and certificate.
 
-Saved OCR remains immutable. Ambiguous values are retained for field review;
-inspection values never replace a missing plate or delivery value.
+Saved OCR remains immutable. Specification uses the selected nameplate's grade
+and diameter, with its selected delivery row as fallback. Inspection arrival
+quantity takes priority over delivery weight; conflicts remain for field review.
 """
 from copy import deepcopy
 from datetime import date
@@ -17,13 +18,17 @@ COLUMNS = [
     dict(key='supply_date', label='供货日期', role='approval', required=True, type='date'),
     dict(key='usage_location', label='使用部位', role='approval', required=True),
     dict(key='heat_lot_no', label='送货单位编号炉批号', role='nameplate', required=True),
-    dict(key='quantity_t', label='验收数量', role='delivery', required=True, type='number', unit='t'),
+    dict(key='quantity_t', label='验收数量', role='inspection', required=True, type='number', unit='t'),
     dict(key='certificate_no', label='质保书编号', role='certificate', required=True),
     dict(key='file_no', label='文件编号', role='approval', required=False),
 ]
 COMPANY = re.compile(r'[\u4e00-\u9fffA-Za-z（）()·]{3,}(?:有限责任公司|股份有限公司|有限公司)')
-GRADE = re.compile(r'\b(?:HRBF|HRB|HPB)\d{3}E?\b', re.I)
-DIAMETER = re.compile(r'(?:[ΦφФØ⌀]\s*(\d{1,2}(?:\.\d+)?)|(?<!\d)(\d{1,2}(?:\.\d+)?)\s*mm)', re.I)
+# Unicode word boundaries treat Chinese labels and Ф as letters. ASCII-only
+# guards allow ``牌号HRB400EФ10`` and delivery cells ``16*12HRB500E`` without
+# accepting a damaged prefix or a four-digit OCR grade.
+GRADE = re.compile(r'(?<![A-Z])(?:HRBF?(?:335|400|500|600|700)E?|HPB(?:235|300))(?![A-Z0-9])', re.I)
+DIAMETER = re.compile(r'(?:[ΦφФØ⌀]\s*(\d{1,2}(?:\.\d+)?)(?![\d.])|(?<!\d)(\d{1,2}(?:\.\d+)?)\s*mm)', re.I)
+SIZE_LABEL = re.compile(r'^(?:钢筋规格|公称直径|直径|规格(?:型号)?|SIZE)[:：]?', re.I)
 DATE = re.compile(r'(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*日?')
 
 
@@ -128,6 +133,77 @@ def field(candidates=(), warnings=()):
 
 def candidate_value(page, block, value, method):
     return dict(value=value, evidence=[evidence(page, block, method)])
+
+
+def diameter_text(value):
+    value = decimal_text(value)
+    return value if value and Decimal('5') <= Decimal(value) <= Decimal('50') else None
+
+
+def specification_field(grades, sizes, warnings=()):
+    return field([dict(value=f"{g['value']}/Ф{d['value']}", evidence=g['evidence']+d['evidence'])
+                  for g in grades['candidates'] for d in sizes['candidates']], warnings)
+
+
+def bind_source(fields, candidate, role):
+    for value in fields.values():
+        value['source_role'] = role
+        for item in value.get('candidates', []):
+            for ev in item.get('evidence', []):
+                ev.update(source_role=role, candidate_id=candidate['candidate_id'], row_id=candidate.get('row_id'))
+    return fields
+
+
+def specification_parts(page, blocks, method, *, specification_column=False):
+    """Read explicit diameter/grade text; plain sizes need a size label or cell.
+
+    The first number in ``16*12HRB500E`` is diameter; its second number is
+    length. Numbers beside length, weight and piece-count labels are excluded.
+    """
+    grades, sizes = [], []
+    for block in blocks:
+        text = compact(block['text'])
+        grades.extend(candidate_value(page, block, match.group().upper(), method+'_grade')
+                      for match in GRADE.finditer(text))
+        diameter_matches = () if re.match(r'^(?:长度|重量|件重|单重|支数|件数|LENGTH|WEIGHT)[:：]?', text, re.I) else DIAMETER.finditer(text)
+        for match in diameter_matches:
+            value = diameter_text(match.group(1) or match.group(2))
+            if value:
+                sizes.append(candidate_value(page, block, value, method+'_diameter'))
+        label = SIZE_LABEL.match(text)
+        suffix = text[label.end():] if label else (text if specification_column else '')
+        plain = re.match(r'^[ΦφФØ⌀]?(\d{1,2}(?:\.\d+)?)(?=$|mm|毫米|[*×xX+/]|盘螺|盘圆|螺纹钢|螺纹|圆钢|钢筋|HRBF?|HPB)', suffix, re.I)
+        if plain and diameter_text(plain.group(1)):
+            sizes.append(candidate_value(page, block, diameter_text(plain.group(1)), method+'_size_cell'))
+        # A grade-first specification can also spell ``HRB400E/10``.
+        if specification_column or label:
+            for match in GRADE.finditer(text):
+                number = re.match(r'^[/／:：][ΦφФØ⌀]?(\d{1,2}(?:\.\d+)?)(?=$|mm|毫米|[*×xX])', text[match.end():], re.I)
+                if number and diameter_text(number.group(1)):
+                    sizes.append(candidate_value(page, block, diameter_text(number.group(1)), method+'_grade_size_cell'))
+        # ``规格`` and its plain value may occupy separate OCR boxes. Choose
+        # the nearest value on that line, keeping both label and value evidence.
+        if label and not suffix and bbox(block):
+            right = [b for b in same_line(blocks, block) if b is not block and bbox(b)
+                     and bbox(b)[0] >= bbox(block)[2]-8]
+            if right:
+                neighbour = right[0]
+                raw = compact(neighbour['text'])
+                number = re.match(r'^[ΦφФØ⌀]?(\d{1,2}(?:\.\d+)?)(?=$|mm|毫米|[*×xX+/])', raw, re.I)
+                gap = bbox(neighbour)[0]-bbox(block)[2]
+                if number and diameter_text(number.group(1)) and gap < max(160, (bbox(block)[3]-bbox(block)[1])*8):
+                    sizes.append(dict(value=diameter_text(number.group(1)), evidence=[
+                        evidence(page, block, method+'_size_label'), evidence(page, neighbour, method+'_labelled_size')]))
+        # An unlabelled ``18`` followed immediately by ``mm`` remains explicit.
+        if not specification_column and re.fullmatch(r'\d{1,2}(?:\.\d+)?', text) and bbox(block):
+            right = [b for b in same_line(blocks, block) if b is not block and bbox(b)
+                     and bbox(b)[0] >= bbox(block)[2]-8]
+            if right and re.match(r'^mm(?:$|[*×xX/])', compact(right[0]['text']), re.I) and bbox(right[0])[0]-bbox(block)[2] < 80:
+                value = diameter_text(text)
+                if value:
+                    sizes.append(dict(value=value, evidence=[evidence(page, block, method+'_split_mm'),
+                        evidence(page, right[0], method+'_diameter_unit')]))
+    return field(grades), field(sizes)
 
 
 def same_line(blocks, label):
@@ -281,14 +357,12 @@ def plate_scope(page, candidate, peers):
 
 def plate_fields(page, candidate, peers):
     blocks, warnings = plate_scope(page, candidate, peers)
-    grades, sizes, manufacturers = [], [], []
+    grade_field, size_field = specification_parts(page, blocks, 'selected_plate')
+    grades, sizes = grade_field['candidates'], size_field['candidates']
+    manufacturers = []
     labelled_manufacturers = []
     for block in blocks:
         text = compact(block['text'])
-        for match in GRADE.finditer(text):
-            grades.append(candidate_value(page, block, match.group().upper(), 'selected_plate_grade'))
-        for match in DIAMETER.finditer(text):
-            sizes.append(candidate_value(page, block, decimal_text(match.group(1) or match.group(2)), 'selected_plate_diameter'))
         for company in COMPANY.findall(text):
             item = candidate_value(page, block, company, 'selected_plate_company')
             manufacturers.append(item)
@@ -296,13 +370,6 @@ def plate_fields(page, candidate, peers):
                 labelled_manufacturers.append(item)
     if labelled_manufacturers:
         manufacturers = labelled_manufacturers
-    # Split size cells: ``18`` followed on the same line by ``mm``.
-    for block in blocks:
-        if not re.fullmatch(r'\d{1,2}(?:\.\d+)?', compact(block['text'])) or not bbox(block):
-            continue
-        right = [b for b in same_line(blocks, block) if bbox(b)[0] >= bbox(block)[2]-8]
-        if right and re.match(r'^mm', compact(right[0]['text']), re.I) and bbox(right[0])[0]-bbox(block)[2] < 80:
-            sizes.append(candidate_value(page, block, decimal_text(compact(block['text'])), 'selected_plate_split_mm'))
     # Only one physical plate permits inventory fallback. Multi-card page fields
     # can contain another card's diameter or its length in metres.
     if len(peers) == 1:
@@ -313,29 +380,36 @@ def plate_fields(page, candidate, peers):
                 if obs.get('field') == key and obs.get('accepted'):
                     value = obs.get('normalized_value')
                     if key == 'diameter_mm':
-                        value = decimal_text(value)
+                        value = diameter_text(value)
+                    elif not GRADE.fullmatch(compact(value)):
+                        value = None
+                    else:
+                        value = compact(value).upper()
                     if value:
                         dest.append(dict(value=value, evidence=[observation_evidence(candidate, obs)]))
     grade_field, size_field = field(grades), field(sizes)
-    specs = [dict(value=f"{g['value']}/Ф{d['value']}", evidence=g['evidence']+d['evidence'])
-             for g in grade_field['candidates'] for d in size_field['candidates']]
+    specs = specification_field(grade_field, size_field, warnings)
+    if not specs['candidates']:
+        specs['warnings'].append('铭牌牌号或直径未完整提取，请核对关联送货单规格或原图。')
     heats = []
     for heat in candidate.get('heat_lots', []):
         anchor = heat_anchor(blocks, heat)
         evs = [evidence(page, anchor, 'selected_plate_heat')] if anchor else [observation_evidence(candidate, o)
             for o in candidate.get('field_observations', []) if o.get('field') == 'heat_lot_no']
         heats.append(dict(value=heat, evidence=evs))
-    return dict(specification=field(specs, warnings+([] if specs else ['铭牌牌号或直径未完整提取，需核对原图填写规格。'])),
-                heat_lot_no=field(heats, warnings), manufacturer=field(manufacturers, warnings))
+    return bind_source(dict(specification=specs, grade=grade_field, diameter_mm=size_field,
+                heat_lot_no=field(heats, warnings), manufacturer=field(manufacturers, warnings)), candidate, 'nameplate')
 
 
 def delivery_table_rows(page):
-    """Read the goods-weight column, excluding bundle weight, totals and signatures."""
+    """Read physical specification/weight rows, excluding totals and signatures."""
     blocks = page_blocks(page)
     titles = [b for b in blocks if '送货单' in b['text'] and center(b)]
     if len(titles) != 1:
         return []
-    headers = [b for b in blocks if re.search(r'(?:规格|格)?/材质', compact(b['text'])) and center(b)]
+    title_y = center(titles[0])[1]
+    headers = [b for b in blocks if center(b) and center(b)[1] > title_y
+               and re.fullmatch(r'(?:规格(?:型号)?(?:[/／]材质)?|格?[/／]材质)', compact(b['text']))]
     if len(headers) > 1:
         return []
     if headers:
@@ -361,12 +435,20 @@ def delivery_table_rows(page):
     right = min((x for x in positions if x > wx), default=wx+180)
     xmin, xmax = (left+wx)/2, (wx+right)/2
     sx = center(header)[0]
+    spec_left = max((center(b)[0] for b in columns if center(b) and center(b)[0] < sx), default=sx-220)
+    spec_right = min((center(b)[0] for b in columns if center(b) and center(b)[0] > sx), default=sx+220)
+    sxmin, sxmax = (spec_left+sx)/2, (sx+spec_right)/2
     footers = [center(b)[1] for b in blocks if center(b) and center(b)[1] > hy and
                re.match(r'合计|送货地址|联系电话|数量[（(]大写|金额',compact(b['text']))]
     bottom = min(footers) if footers else hy+350
-    specs = [b for b in blocks if center(b) and hy+12 < center(b)[1] < bottom
-             and abs(center(b)[0]-sx) < max(100,(bbox(header)[2]-bbox(header)[0]))
-             and re.search(r'(?:HRBF|HRB|HPB|RB|B)[0-9O]{3}E?', compact(b['text']), re.I)]
+    spec_cells = [b for b in blocks if center(b) and hy+12 < center(b)[1] < bottom
+                  and sxmin <= center(b)[0] < sxmax]
+    specs = []
+    for cell in spec_cells:
+        grade, diameter = specification_parts(page, [cell], 'delivery_specification_column', specification_column=True)
+        if grade['candidates'] or diameter['candidates'] or re.search(
+                r'(?:HRBF|HRB|HPB|RB|B)[0-9O]{3}E?', compact(cell['text']), re.I):
+            specs.append(cell)
     unique_specs = []
     for spec in sorted(specs, key=lambda b:center(b)[1]):
         if not unique_specs or abs(center(spec)[1]-center(unique_specs[-1])[1]) > max(12,(bbox(spec)[3]-bbox(spec)[1])*.65):
@@ -397,7 +479,18 @@ def delivery_table_rows(page):
             lines[-1].append(anchor)
     rows = []
     for line in lines:
-        spec = next((b for b in line if b in unique_specs), None)
+        anchor = line[0]
+        cells = [b for b in spec_cells if abs(center(b)[1]-center(anchor)[1]) <= max(
+            15, (bbox(anchor)[3]-bbox(anchor)[1])*.65, (bbox(b)[3]-bbox(b)[1])*.65)]
+        cells.sort(key=lambda b: bbox(b)[0])
+        raw_specification = ''.join(b['text'] for b in cells)
+        grade, diameter = specification_parts(page, cells, 'delivery_specification_column', specification_column=True)
+        spec_field = specification_field(grade, diameter)
+        for value in (grade, diameter, spec_field):
+            for item in value['candidates']:
+                for ev in item['evidence']:
+                    ev.update(label=header['text'], label_polygon_page=header.get('polygon_page'),
+                              physical_row_index=len(rows)+1)
         values = [b for b in line if b in weight_blocks]
         candidates = []
         for value_block in values:
@@ -406,11 +499,12 @@ def delivery_table_rows(page):
             if value and Decimal(value) > 0:
                 ev = evidence(page,value_block,'delivery_goods_weight_column')
                 ev.update(label=weight_header['text'],label_polygon_page=weight_header.get('polygon_page'),
-                          specification_raw_text=spec['text'] if spec else None,
-                          specification_polygon_page=spec.get('polygon_page') if spec else None,
+                          specification_raw_text=raw_specification or None,
+                          specification_polygon_page=cells[0].get('polygon_page') if cells else None,
                           column_unit='t', physical_row_index=len(rows)+1)
                 candidates.append(dict(value=value,evidence=[ev]))
-        rows.append(dict(physical_row_index=len(rows)+1,specification=spec['text'] if spec else '',
+        rows.append(dict(physical_row_index=len(rows)+1, specification=raw_specification,
+                         specification_field=spec_field, grade=grade, diameter_mm=diameter,
                          quantity=field(candidates)))
     return rows
 
@@ -437,12 +531,14 @@ def delivery_fields(page, candidate):
     if explicit:
         suppliers = explicit
     quantities = []
+    grade, diameter = field(), field()
     table_rows = delivery_table_rows(page)
     row_number = re.search(r'row(\d+)$', candidate.get('row_id') or '')
     selected_rows = [r for r in table_rows if r['physical_row_index'] == int(row_number.group(1))] if row_number else (
         table_rows if len(table_rows) == 1 else [])
     if len(selected_rows) == 1:
         quantities = selected_rows[0]['quantity']['candidates']
+        grade, diameter = selected_rows[0]['grade'], selected_rows[0]['diameter_mm']
     observations = candidate.get('field_observations', []) if candidate.get('row_id') else []
     weight_obs = [o for o in observations if o.get('field') in ('quantity_t', 'weight_t') and o.get('accepted')]
     # Prefer the goods weight column over a separate received-quantity column.
@@ -451,8 +547,26 @@ def delivery_fields(page, candidate):
         value = decimal_text(obs.get('value_t') or obs.get('normalized_value'))
         if value and Decimal(value) > 0:
             quantities.append(dict(value=value, evidence=[observation_evidence(candidate, obs)]))
-    return dict(supplier=field(suppliers), quantity_t=field(quantities,
-        ['送货行未定位，请按所选铭牌对应规格核对送货原图后填写重量（吨）。'] if not candidate.get('row_id') and not quantities else []))
+    # Inventory observations are row-scoped. Never borrow a page-wide grade or
+    # diameter when the selected delivery has several physical goods rows.
+    for key, target in [('grade', grade), ('diameter_mm', diameter)]:
+        if target['candidates']:
+            continue
+        values = []
+        for obs in observations:
+            if obs.get('field') != key or not obs.get('accepted'):
+                continue
+            raw = compact(obs.get('normalized_value'))
+            value = diameter_text(raw) if key == 'diameter_mm' else (raw.upper() if GRADE.fullmatch(raw) else None)
+            if value:
+                values.append(dict(value=value, evidence=[observation_evidence(candidate, obs)]))
+        target.update(field(values))
+    specs = specification_field(grade, diameter)
+    if not candidate.get('row_id') and len(selected_rows) != 1:
+        specs['warnings'].append('送货单包含多个货物行且未定位所选行，不能借用其他行规格。')
+    return bind_source(dict(supplier=field(suppliers), grade=grade, diameter_mm=diameter,
+        specification=specs, quantity_t=field(quantities,
+        ['送货行未定位，请按所选铭牌对应规格核对送货原图后填写重量（吨）。'] if not candidate.get('row_id') and not quantities else [])), candidate, 'delivery')
 
 
 CERT_ID = re.compile(r'(?<![A-Z0-9])(?:[A-Z]{1,4}[A-Z0-9._/-]{5,}|\d{7,})(?![A-Z0-9])', re.I)
@@ -515,7 +629,15 @@ def certificate_label_values(page, block, blocks):
     return result
 
 
-def build_filling_profile(result, index, classification, *, submission_forms=(), submission_duplicates=()):
+def build_filling_profile(result, index, classification, *, inspection_evidence=None,
+                          submission_forms=(), submission_duplicates=()):
+    """Build ledger evidence while retaining both approval and inspection sources.
+
+    ``submission_forms`` is optional for legacy V6 saved records. Inspection
+    evidence is independently optional because older records point to their
+    original cell result through ``source_result`` and ``source_cells``.
+    """
+    from .ledger_sources import inspection_fields
     pages = {p['page_no']: p for p in index['pages']}
     saved = {}
     for form in submission_forms:
@@ -532,7 +654,10 @@ def build_filling_profile(result, index, classification, *, submission_forms=(),
         if groups:
             context['duplicate_candidates'] = groups
             context['fields']['file_no']['warnings'].append('重复报审候选的编号可能不同；请按所选页原图核对，未自动合并或替换。')
-    resources = {role: {} for role in ('nameplate', 'delivery', 'certificate')}
+    resources = {role: {} for role in ('nameplate', 'delivery', 'certificate', 'inspection')}
+    for entry in result.get('entries', []):
+        resources['inspection'][entry['record_id']] = inspection_fields(
+            entry['record'], entry['record_id'], (inspection_evidence or {}).get(entry['record_id']))
     for candidate in result.get('nameplate_inventory', []):
         page = pages[candidate['page_no']]
         peers = [c for c in result['nameplate_inventory'] if c['page_no'] == candidate['page_no']]
@@ -541,7 +666,7 @@ def build_filling_profile(result, index, classification, *, submission_forms=(),
         resources['delivery'][candidate['candidate_id']] = delivery_fields(pages[candidate['page_no']], candidate)
     for candidate in result.get('certificate_page_inventory', []):
         resources['certificate'][candidate['candidate_id']] = certificate_fields(candidate, pages[candidate['page_no']])
-    return dict(schema_version='rebar-ledger-evidence-v1', material_id='rebar', columns=deepcopy(COLUMNS),
+    return dict(schema_version='rebar-ledger-evidence-v2', material_id='rebar', columns=deepcopy(COLUMNS),
                 approval_contexts=contexts, resources=resources,
                 submission_duplicate_candidates=deepcopy(list(submission_duplicates)),
                 template_reference='报审表字文字内容提取项目说明.docx / word/media/image2.png',

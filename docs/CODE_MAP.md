@@ -40,6 +40,7 @@ github_project/
 │   │       ├── review.py             # 全页分类修正、质编号检索、生成审核输入
 │   │       ├── matching.py           # 当前网页使用的钢筋四表匹配规则
 │   │       ├── filling.py            # 钢筋台账列定义及字段提取、溯源
+│   │       ├── ledger_sources.py     # 铭牌/送货规格组合、检验数量优先及差异提示
 │   │       └── config/
 │   │           ├── material.json     # 材料信息、模板、匹配阈值、统计单位
 │   │           ├── attachment_rules.json # 附件关键词、区域、OCR 配置
