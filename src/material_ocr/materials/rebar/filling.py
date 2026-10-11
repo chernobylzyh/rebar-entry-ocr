@@ -259,6 +259,32 @@ def approval_context(page):
     return dict(context_id=f"approval:{page['page_no']}", page_no=page['page_no'], fields=fields)
 
 
+def submission_context(form):
+    """Adapt saved fixed-template observations to the existing ledger contract.
+
+    Page polygons remain in their own 300DPI rendered-page coordinate system;
+    they are not silently reused as 180DPI attachment coordinates.
+    """
+    mapping = dict(material_name='material_name', usage_location='use_location',
+                   supply_date='supply_date', file_no='document_no')
+    fields = {}
+    for key, source_key in mapping.items():
+        observed = form.get('fields', {}).get(source_key, {})
+        value = form.get('values', {}).get(source_key)
+        warnings = list(observed.get('issues', [])) + list(form.get('issues', []))
+        ev = dict(page_no=form['page_no'], region_id=f"submission:{source_key}",
+                  polygon_page=deepcopy(observed.get('polygon_page')),
+                  raw_text=observed.get('raw_text'), score=observed.get('min_score'),
+                  source_result=form.get('source_result'), crop_path=observed.get('crop_path'),
+                  coordinate_system=form.get('coordinate_system', 'original_300dpi_page_pixels_top_left'),
+                  render_dpi=form.get('render_dpi', 300), page_pixel_size=form.get('page_pixel_size'),
+                  method='approval_fixed_template_ocr')
+        fields[key] = field([dict(value=value, evidence=[ev])] if value else [], list(dict.fromkeys(warnings)))
+    return dict(context_id=f"approval:{form['page_no']}", page_no=form['page_no'], fields=fields,
+                extraction_method='fixed_template_ocr', source_record_id=form.get('record_id'),
+                ready_for_search=False)
+
+
 def heat_anchor(blocks, heat):
     pattern = re.compile(r'(?<![A-Z0-9])'+re.escape(compact(heat).upper())+r'(?![A-Z0-9])')
     matches = [b for b in blocks if pattern.search(compact(b['text']).upper()) and center(b)]
@@ -603,11 +629,31 @@ def certificate_label_values(page, block, blocks):
     return result
 
 
-def build_filling_profile(result, index, classification, *, inspection_evidence=None):
+def build_filling_profile(result, index, classification, *, inspection_evidence=None,
+                          submission_forms=(), submission_duplicates=()):
+    """Build ledger evidence while retaining both approval and inspection sources.
+
+    ``submission_forms`` is optional for legacy V6 saved records. Inspection
+    evidence is independently optional because older records point to their
+    original cell result through ``source_result`` and ``source_cells``.
+    """
     from .ledger_sources import inspection_fields
     pages = {p['page_no']: p for p in index['pages']}
-    contexts = [approval_context(pages[p['page_no']]) for p in classification['pages']
-                if 'approval_form' in p['classification']]
+    saved = {}
+    for form in submission_forms:
+        if form.get('pdf_sha256') != index['pdf_sha256']:
+            raise ValueError('报审表与附件OCR不是同一PDF')
+        if form.get('page_no') not in pages or form['page_no'] in saved:
+            raise ValueError('报审表来源页不存在或重复')
+        saved[form['page_no']] = form
+    context_pages = sorted(set(saved) | {p['page_no'] for p in classification['pages']
+                                        if 'approval_form' in p['classification']})
+    contexts = [submission_context(saved[n]) if n in saved else approval_context(pages[n]) for n in context_pages]
+    for context in contexts:
+        groups = [deepcopy(g) for g in submission_duplicates if context['page_no'] in g.get('page_nos', [])]
+        if groups:
+            context['duplicate_candidates'] = groups
+            context['fields']['file_no']['warnings'].append('重复报审候选的编号可能不同；请按所选页原图核对，未自动合并或替换。')
     resources = {role: {} for role in ('nameplate', 'delivery', 'certificate', 'inspection')}
     for entry in result.get('entries', []):
         resources['inspection'][entry['record_id']] = inspection_fields(
@@ -622,5 +668,6 @@ def build_filling_profile(result, index, classification, *, inspection_evidence=
         resources['certificate'][candidate['candidate_id']] = certificate_fields(candidate, pages[candidate['page_no']])
     return dict(schema_version='rebar-ledger-evidence-v2', material_id='rebar', columns=deepcopy(COLUMNS),
                 approval_contexts=contexts, resources=resources,
+                submission_duplicate_candidates=deepcopy(list(submission_duplicates)),
                 template_reference='报审表字文字内容提取项目说明.docx / word/media/image2.png',
                 quantity_unit='t', row_identity='one_selected_physical_nameplate')

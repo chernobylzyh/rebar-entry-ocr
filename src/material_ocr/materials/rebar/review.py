@@ -246,8 +246,15 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
                 coordinate_system=source_cache[path].get('page', {}).get('coordinate_system'),
                 blocks=cell.get('blocks'), crop_path=cell.get('crop_path'))
     def enrich(result):
+        # Keep both evidence streams: submission OCR supplies approval
+        # contexts, while the saved inspection cell supplies authoritative
+        # arrival quantity and its original coordinates.
+        result['submission_duplicate_candidates'] = deepcopy(
+            records.get('submission_duplicate_candidates', []))
         result['filling_profile'] = build_filling_profile(result, index, classification,
-            inspection_evidence=inspection_evidence)
+            inspection_evidence=inspection_evidence,
+            submission_forms=records.get('submission_forms', []),
+            submission_duplicates=records.get('submission_duplicate_candidates', []))
     return build(args.output, inputs=inputs, pdf=args.pdf, base=args.index.parent,
                  matcher=rematch, matching_options=matching_options, result_enricher=enrich)
 

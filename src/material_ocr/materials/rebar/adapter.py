@@ -20,7 +20,7 @@ class RebarAdapter(MaterialAdapter):
 
     def fingerprint(self):
         digest = hashlib.sha256()
-        for name in ['material.json', self.config['attachment_rules'], *self.config['inspection_templates']]:
+        for name in ['material.json', self.config['attachment_rules'], 'submission_b06.json', *self.config['inspection_templates']]:
             digest.update(rebar_config(name).read_bytes())
         return digest.hexdigest()
 
