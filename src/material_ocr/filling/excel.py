@@ -65,7 +65,7 @@ class RebarLedgerWriter(ApprovedFormWriter):
                 sheet.write_comment(index, 0, f"原文件：{row['pdf_name']}\n铭牌：第{row['sources']['nameplate']['page_no']}页\n检验记录：{', '.join(row['record_ids'])}\n字段审核：{row['confirmed_at']}")
             sheet.set_landscape(); sheet.set_paper(9); sheet.fit_to_pages(1, 0); sheet.repeat_rows(0, 1)
             sources = book.add_worksheet('字段溯源')
-            titles = ['台账行', '材料字段', '导出值', 'OCR观察值', '是否补正', '来源表单', 'PDF页码', '选中表单/送货行', '原文', '原PDF坐标', 'OCR转正坐标', '提取方法', '文件', '文件SHA256', '字段确认时间', '审核备注']
+            titles = ['台账行', '材料字段', '导出值', 'OCR观察值', '是否补正', '来源表单', 'PDF页码', '选中表单/送货行', '原文', '原PDF坐标', 'OCR转正坐标', '提取方法', '文件', '文件SHA256', '字段确认时间', '审核备注', '坐标源图尺寸', '坐标体系']
             sources.write_row(0, 0, titles, header)
             source_row = 1
             for index, row in enumerate(approved_records, 1):
@@ -74,16 +74,23 @@ class RebarLedgerWriter(ApprovedFormWriter):
                     info = row['fields'][key]
                     evidences = [ev for c in info['candidates'] for ev in c.get('evidence', [])] or [{}]
                     for ev in evidences:
-                        source = row['sources'].get(role, {})
-                        page_no = ev.get('page_no') or source.get('page_no') or (int(row['context_id'].split(':')[-1]) if row.get('context_id') else '')
+                        actual_role = ev.get('source_role') or info.get('source_role') or role
+                        source = row['sources'].get(actual_role, {})
+                        page_no = ev.get('page_no') or source.get('page_no')
+                        if not page_no and actual_role == 'approval' and row.get('context_id'):
+                            page_no = int(row['context_id'].split(':')[-1])
                         sources.write_row(source_row, 0, [index, column['label'], row['values'][key],
                             ' / '.join(c['value'] for c in info['candidates']), '是' if info['corrected'] else '否',
-                            dict(approval='报审表',nameplate='铭牌',delivery='送货单',certificate='质量证明书')[role],
-                            page_no, source.get('row_id') or source.get('candidate_id') or row.get('context_id', ''),
+                            dict(approval='报审表',nameplate='铭牌',delivery='送货单',certificate='质量证明书',
+                                 inspection='检验记录',mixed='铭牌/送货单').get(actual_role, actual_role),
+                            page_no or '', ev.get('cell_id') or ev.get('record_id') or ev.get('row_id') or
+                            source.get('row_id') or ev.get('candidate_id') or source.get('candidate_id') or row.get('context_id', ''),
                             ev.get('raw_text') or '', json.dumps(ev.get('polygon_page'), ensure_ascii=False),
                             json.dumps(ev.get('polygon_ocr'), ensure_ascii=False), ev.get('method') or '',
-                            row['pdf_name'], row['pdf_sha256'], row['confirmed_at'], row.get('review_note', '')], text)
+                            row['pdf_name'], row['pdf_sha256'], row['confirmed_at'], row.get('review_note', ''),
+                            json.dumps(ev.get('source_pixel_size'), ensure_ascii=False),
+                            ev.get('coordinate_system') or '附件 OCR 渲染像素；见审核原图'], text)
                         source_row += 1
-            sources.set_column(0, 1, 18); sources.set_column(2, 15, 28); sources.set_column(9, 10, 44)
+            sources.set_column(0, 1, 18); sources.set_column(2, 17, 28); sources.set_column(9, 10, 44)
             sources.freeze_panes(1, 2); sources.autofilter(0, 0, source_row-1, len(titles)-1)
         return output

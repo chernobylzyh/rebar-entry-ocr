@@ -28,13 +28,15 @@
 - OCR 原文/图像、四表关联、审核 JSON、浏览器记录备份、CSV、Excel 和日志等处理产物应统一置于 `runs/`。
 - 虚拟环境、Python 缓存和构建产物。
 
-本轮已将上述此前暂存的本地目录移出 Git 索引，文件仍完整保留在本机。`.gitignore` 本身不会取消已跟踪文件，已跟踪路径需要 `git rm --cached` 处理；本轮没有删除本地目录。
+最小交付版本已将上述本地目录移出 Git 索引，文件仍完整保留在本机。`.gitignore` 本身不会取消已跟踪文件；若以后发现本地数据被跟踪，应先检查，再用 `git rm --cached` 移出索引。
 
 新克隆没有开发者业务样本和既有结果。接收方首次运行会创建模型缓存和本地任务目录，运行时在任务 `experiment/` 子目录保存配置和状态；它与不提交的顶层 `experiments/` 相互独立。
 
 ## 检查和提交
 
-当前分支是 `phase2-form-matching`，已有远端 `origin`。本轮准备了提交范围及说明，未 commit 或 push。
+截至 2026-10-11，当前分支是 `phase2-form-matching`，远端 `origin` 指向 `git@github.com:chernobylzyh/rebar-entry-ocr.git`。最小运行版本已在提交 `7c3e3a2` 中；本次规格与验收数量修复仍在工作区，尚未暂存、commit 或 push。
+
+本次修复包括：规格优先取铭牌牌号与直径，缺失时参考已关联送货物理行；验收数量优先取检验记录进场数量，重复记录不累加；原文、单位、坐标、差异提示和 Excel 来源同步更新。保存数据回放与回归记录留在本机，不随代码提交。
 
 在仓库根目录执行：
 
@@ -42,26 +44,30 @@
 git branch --show-current
 git status --short
 git diff --check
-git add --dry-run -A
+git add --dry-run src/material_ocr README.md docs/CODE_MAP.md docs/WEB_USAGE.md docs/WORKFLOW.md docs/GITHUB_SUBMISSION.md
 ```
 
 确认忽略目录未出现在待加入清单，再更新暂存并检查：
 
 ```bash
-git add -A
+git add src/material_ocr README.md docs/CODE_MAP.md docs/WEB_USAGE.md docs/WORKFLOW.md docs/GITHUB_SUBMISSION.md
 git diff --cached --name-only
 git diff --cached --stat
 git diff --cached --check
 ```
 
-当前迁移会显示旧根脚本的删除及 `src/` 内新增，属于预期；不要为保留本地实验和测试而重新加入这些忽略目录。
+本次应包含 `src/material_ocr/materials/rebar/ledger_sources.py` 新文件，以及相关运行代码和当前说明的修改。不要漏掉该新模块，也不要强制加入本地实验、测试或处理结果。
 
 完成代码范围检查后提交与推送：
 
 ```bash
-git commit -m "Deliver runnable material OCR workbench and usage documentation"
+git commit -m "Fix rebar ledger specification and inspection quantity sources"
 git push -u origin phase2-form-matching
 ```
+
+推送后打开 [GitHub 的 phase2-form-matching 分支](https://github.com/chernobylzyh/rebar-entry-ocr/tree/phase2-form-matching)，检查最新提交与文件。推送到分支不会自动合并到默认分支；需要合并时，在 GitHub 创建 Pull Request。
+
+若推送提示远端有新提交，先运行 `git fetch origin` 和 `git log --oneline --left-right HEAD...origin/phase2-form-matching` 查看双方差异；确认后再处理合并或 rebase，不使用强制推送。若提示 `Permission denied (publickey)`，需要在本机配置 GitHub SSH 密钥，或将 origin 改成 HTTPS 并通过 GitHub 凭据认证。
 
 接收方按 [README](../README.md) 安装，按 [核验说明](ACCEPTANCE.md) 上传自己的样本。此次不分发开发者实验结论作为对方环境的核验结果，也不要求交接代码前重跑整份 PDF。
 

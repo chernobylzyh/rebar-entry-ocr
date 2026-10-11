@@ -328,6 +328,11 @@ def extract(args, engine=None):
             "row_number_source": retry['method'] if retry and retry['selected_text'] is not None else "initial_ocr",
             "row_number_retry": retry,
             "source_cells": refs, "ready_for_search": False,
+            "field_evidence": {name: dict(cell_id=cid, polygon_page=cells[cid]['polygon_page'],
+                raw_text=cells[cid]['raw_text'], blocks=cells[cid]['blocks'],
+                source_pixel_size=page_meta.get('pixel_size'),
+                coordinate_system=page_meta.get('coordinate_system'),
+                crop_path=cells[cid]['crop_path']) for name, cid in refs.items()},
             "status": "needs_review" if record["issues"] else "rule_pass_review_required"})
         record.update(validation_states(record))
         records.append(record)

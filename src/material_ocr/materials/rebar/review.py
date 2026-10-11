@@ -222,8 +222,32 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
                   catalog=save('keyword_catalog.json', dict(keyword_catalog=catalog)),
                   records=args.records, index=args.index)
     from material_ocr.materials.rebar.filling import build_filling_profile
+    # Older merged records reference their original cell OCR instead of
+    # carrying coordinates. Read only results inside this inspection folder.
+    inspection_evidence, source_cache = {}, {}
+    for record in records['records']:
+        if record.get('field_evidence', {}).get('weight'):
+            inspection_evidence[record['record_id']] = record['field_evidence']['weight']
+            continue
+        reference = record.get('source_result')
+        if not reference:
+            continue
+        path = (args.records.parent / reference).resolve()
+        if not path.is_relative_to(args.records.parent.resolve()) or not path.is_file():
+            continue
+        if path not in source_cache:
+            source_cache[path] = json.loads(path.read_text())
+        cell_id = record.get('source_cells', {}).get('weight')
+        cell = source_cache[path].get('cells', {}).get(cell_id)
+        if cell:
+            inspection_evidence[record['record_id']] = dict(cell_id=cell_id,
+                polygon_page=cell.get('polygon_page'), raw_text=cell.get('raw_text'),
+                source_pixel_size=source_cache[path].get('page', {}).get('pixel_size'),
+                coordinate_system=source_cache[path].get('page', {}).get('coordinate_system'),
+                blocks=cell.get('blocks'), crop_path=cell.get('crop_path'))
     def enrich(result):
-        result['filling_profile'] = build_filling_profile(result, index, classification)
+        result['filling_profile'] = build_filling_profile(result, index, classification,
+            inspection_evidence=inspection_evidence)
     return build(args.output, inputs=inputs, pdf=args.pdf, base=args.index.parent,
                  matcher=rematch, matching_options=matching_options, result_enricher=enrich)
 

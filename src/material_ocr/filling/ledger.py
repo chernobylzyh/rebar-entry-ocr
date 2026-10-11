@@ -98,10 +98,13 @@ def preview_ledger(result, state):
     if not isinstance(reviews, dict):
         raise ValueError('字段审核状态格式不正确')
     profile_version = digest(profile)
+    entry_by_id = {e['record_id']: e['record'] for e in result.get('entries', [])}
     rows = []
     for bundle in bundles:
         group_id, forms = bundle['group_id'], bundle['forms']
         signature = digest(dict(pdf=result['pdf_sha256'], profile=profile_version, group_id=group_id,
+            field_policy='rebar-inspection-first-v2' if profile['material_id'] == 'rebar' else None,
+            inspection_records={rid: entry_by_id.get(rid) for rid in bundle['record_ids']},
             selections={role: forms[role]['candidate_id'] for role in INVENTORIES},
             state=bundle['state'], confirmed_at=bundle.get('confirmed_at')))
         saved = reviews.get(group_id, {})
@@ -113,6 +116,21 @@ def preview_ledger(result, state):
         fields = deepcopy(context['fields']) if context else {}
         for role in INVENTORIES:
             fields.update(deepcopy(profile['resources'][role].get(forms[role]['candidate_id'], {})))
+        if profile['material_id'] == 'rebar':
+            from material_ocr.materials.rebar.ledger_sources import (inspection_fields,
+                resolve_quantity, resolve_specification, sourced)
+            resources = {role: {key: sourced(info, role, dict(candidate_id=forms[role]['candidate_id'],
+                page_no=forms[role]['page_no'], row_id=forms[role].get('row_id')))
+                for key, info in profile['resources'][role].get(forms[role]['candidate_id'], {}).items()}
+                for role in INVENTORIES}
+            for resource in resources.values():
+                fields.update(resource)
+            inspections = [sourced(profile['resources'].get('inspection', {}).get(rid,
+                inspection_fields(entry_by_id.get(rid, {}), rid))['quantity_t'], 'inspection')
+                for rid in bundle['record_ids']]
+            fields['specification'] = resolve_specification(resources['nameplate'], resources['delivery'])
+            fields['quantity_t'] = resolve_quantity(inspections, resources['delivery'].get('quantity_t',
+                sourced(None, 'delivery')))
         for column in columns:
             fields.setdefault(column['key'], dict(value='', status='missing', candidates=[], warnings=[]))
         extracted = {column['key']: fields[column['key']]['value'] for column in columns}
