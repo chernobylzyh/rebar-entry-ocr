@@ -15,7 +15,7 @@ def main():
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--device',required=True)
     p.add_argument('--model-cache',type=Path,required=True)
-    p.add_argument('--layout',default='auto')
+    p.add_argument('--layout',choices=['auto','6_rows','11_rows','adaptive'],default='auto')
     p.add_argument('--page-index',type=Path)
     p.add_argument('--pages',nargs='+',type=int)
     p.add_argument('--profile',default='batched_gpu')
@@ -26,12 +26,13 @@ def main():
     if args.stage=='inspection':
         from material_ocr.extraction.batch import run
         templates=[rebar_config('inspection_6_rows.json'),rebar_config('inspection_11_rows.json')]
-        if args.layout!='auto':
+        if args.layout not in ('auto','adaptive'):
             templates=[rebar_config(f'inspection_{args.layout}.json')]
         def report(stage,current,total,message):
             write_json(args.out.parent/'stage_progress.json',dict(stage=stage,current=current,total=total,message=message))
         run(SimpleNamespace(pdf=str(args.pdf),out=str(args.out),template=str(templates[0]),templates=templates,
-                            device=args.device,scan_dpi=180,extract_draft=True),progress=report)
+                            device=args.device,scan_dpi=180,extract_draft=True,
+                            entry_backend='adaptive' if args.layout=='adaptive' else 'template'),progress=report)
     else:
         from material_ocr.ocr.attachments import build_attachment_index,load_rules
         rules=load_rules(rebar_config('attachment_rules.json'))

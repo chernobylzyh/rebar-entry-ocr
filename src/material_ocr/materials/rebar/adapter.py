@@ -16,7 +16,7 @@ class RebarAdapter(MaterialAdapter):
     def __init__(self):
         self.config = json.loads(rebar_config('material.json').read_text())
         self.info = MaterialInfo('rebar', self.config['name'], True, self.config['description'],
-                                 ('auto', '6_rows', '11_rows'))
+                                 ('auto', '6_rows', '11_rows', 'adaptive'))
 
     def fingerprint(self):
         digest = hashlib.sha256()
@@ -35,8 +35,7 @@ class RebarAdapter(MaterialAdapter):
         page_index = inspection / 'page_index.json'
         manifest = json.loads(page_index.read_text())
         records = inspection / 'records_all_pages.json'
-        failures = [p['page_no'] for p in manifest['pages'] if p['decision'] == 'target'
-                    and p.get('extraction_status') != 'draft_ready_pending_review']
+        failures = inspection_failures(manifest)
         if failures:
             raise ValueError(f'已找到检验记录页{failures}，但表格定位或提取未通过；请查看逐页诊断和原图')
         if not json.loads(records.read_text())['records']:
@@ -140,3 +139,20 @@ class RebarAdapter(MaterialAdapter):
     def form_writer(self):
         from material_ocr.filling.excel import RebarLedgerWriter
         return RebarLedgerWriter()
+
+
+def inspection_failures(manifest):
+    """OCR warnings remain reviewable; incomplete/uncertain geometry blocks stage two."""
+    failures = []
+    for page in manifest['pages']:
+        if page['decision'] != 'target':
+            continue
+        status = page.get('extraction_status')
+        summary = page.get('summary') or {}
+        warnings_only = (status == 'adaptive_needs_review' and summary.get('product_count',0) > 0
+                         and summary.get('table_issue_count') == 0
+                         and summary.get('business_issue_record_count') == 0
+                         and not page.get('calibration_requires_review',True))
+        if page.get('extraction_error') or (status != 'draft_ready_pending_review' and not warnings_only):
+            failures.append(page['page_no'])
+    return failures

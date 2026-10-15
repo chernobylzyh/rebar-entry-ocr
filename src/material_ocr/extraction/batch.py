@@ -60,7 +60,10 @@ def run(args, *, progress=None):
     pdf_path = Path(args.pdf).resolve()
     # 先检查输入，避免路径错误也留下输出目录。
     pdf_sha = digest(pdf_path)
-    config = read_json(args.template)
+    backend = getattr(args, 'entry_backend', 'template')
+    if backend not in ('template', 'adaptive'):
+        raise ValueError('entry_backend must be template or adaptive')
+    config = read_json(args.template) if backend == 'template' else {'entry_backend':'adaptive','fixed_template_used':False}
     templates = getattr(args, 'templates', [args.template])
     out = Path(args.out)
     out.mkdir(parents=True,exist_ok=False)
@@ -74,6 +77,7 @@ def run(args, *, progress=None):
         orientation_error = str(exc)
         print(f'方向模型不可用，改用四方向页头OCR检查: {exc}',flush=True)
     manifest = {"pdf_name":pdf_path.name,"pdf_sha256":pdf_sha,"template":config,
+                "entry_backend":backend,"status":"running",
                 "dpi_scan":args.scan_dpi,"extract_draft":args.extract_draft,
                 "notes":["all_pages_scanned_no_early_stop","unknown_pages_retained_for_review",
                          "no_automatic_deduplication","geometry_is_not_automatically_human_verified"],
@@ -136,6 +140,8 @@ def run(args, *, progress=None):
         pdf.close()
     records = []
     submissions = []
+    blank_candidates = []
+    adaptive_engine = None
     for entry in manifest["pages"]:
         if entry["decision"] not in ("target", "submission"):
             continue
@@ -161,6 +167,31 @@ def run(args, *, progress=None):
                     done = sum('extraction_status' in p for p in manifest['pages'] if p['decision'] in ('target','submission'))
                     total = sum(p['decision'] in ('target','submission') for p in manifest['pages'])
                     progress('extract', done, total, f'报审与检验表提取 {done}/{total}')
+                continue
+            if backend == 'adaptive':
+                from material_ocr.extraction.adaptive import AdaptiveBackend, calibrate_page
+                calibration = calibrate_page(original,entry.get('rotation_ccw',0),
+                                             deskew=not getattr(args,'no_deskew',False))
+                entry['calibration_path'] = str((original/'adaptive'/'calibration.json').relative_to(out))
+                entry['calibration_requires_review'] = calibration['requires_review']
+                if not args.extract_draft:
+                    entry['extraction_status'] = 'adaptive_calibration_ready'
+                else:
+                    if adaptive_engine is None:
+                        adaptive_engine = AdaptiveBackend(args.device)
+                    result = adaptive_engine.extract(original,page_no,pdf_sha,calibration)
+                    entry['result_path'] = str((original/'adaptive'/'records.json').relative_to(out))
+                    entry['summary'] = result['summary']
+                    entry['extraction_status'] = ('draft_ready_pending_review'
+                        if result['summary']['status'] == 'rule_pass_review_required' else 'adaptive_needs_review')
+                    records.extend({**r,'source_result':entry['result_path']} for r in result['records'])
+                    blank_candidates.extend(result['blank_candidates'])
+                    print(f"page {page_no}: adaptive products={len(result['records'])}, blanks={len(result['blank_candidates'])}, status={result['summary']['status']}",flush=True)
+                write_json(out/'page_index.json',manifest)
+                if progress:
+                    done = sum('extraction_status' in p for p in manifest['pages'] if p['decision'] in ('target','submission'))
+                    total = sum(p['decision'] in ('target','submission') for p in manifest['pages'])
+                    progress('extract',done,total,f'报审与检验表提取 {done}/{total}')
                 continue
             entry['template_attempts'] = []
             geometry = None
@@ -213,9 +244,19 @@ def run(args, *, progress=None):
     manifest["target_pages"] = [p["page_no"] for p in manifest["pages"] if p["decision"]=="target"]
     manifest['submission_pages'] = [p['page_no'] for p in manifest['pages'] if p['decision']=='submission']
     manifest["review_pages"] = [p["page_no"] for p in manifest["pages"] if p["decision"] in ("review","error")]
+    manifest['extraction_review_pages'] = [p['page_no'] for p in manifest['pages']
+        if p.get('extraction_error') or p.get('extraction_status') in ('adaptive_needs_review','geometry_failed')
+        or p.get('calibration_requires_review')]
+    manifest['status'] = ('completed_with_review' if manifest['review_pages'] or manifest['extraction_review_pages']
+                          else 'completed_pending_human_review')
+    if not manifest['target_pages']:
+        manifest['status'] = 'no_entry_pages_found_review_required'
     write_json(out/"page_index.json",manifest)
     submission_duplicates = submission_duplicate_candidates(submissions)
-    merged = {"schema_version":"v7","pdf_sha256":pdf_sha,"records":records,
+    merged = {"schema_version":"v7_adaptive_v1" if backend=='adaptive' else "v7","pdf_sha256":pdf_sha,"records":records,
+              "entry_backend":backend,"blank_candidates":blank_candidates,"status":manifest['status'],
+              "target_pages":manifest['target_pages'],"extraction_review_pages":manifest['extraction_review_pages'],
+              "extraction_failures":[p for p in manifest['pages'] if p.get('extraction_error')],
               'submission_forms':submissions, 'submission_duplicate_candidates':submission_duplicates,
               "duplicate_candidates":duplicate_candidates(records),
               "review_pages":manifest["review_pages"],"ready_for_search":False,
@@ -230,11 +271,15 @@ def run(args, *, progress=None):
         thumbnails=''.join(f'<a href="{a["header_image"]}"><img src="{a["header_image"]}" width="360"></a>' for a in entry["attempts"])
         links=''
         if "run_dir" in entry:
-            preview_name = 'submission_page_preview.png' if entry['decision']=='submission' else 'grid_preview.png'
+            preview_name = ('submission_page_preview.png' if entry['decision']=='submission' else
+                            'adaptive/input.png' if backend=='adaptive' else 'grid_preview.png')
             links+=f'<a href="{entry["run_dir"]}/{preview_name}">几何预览</a>'
         if "result_path" in entry:
-            review_dir = 'submission_ocr' if entry['decision']=='submission' else 'ocr_draft'
-            links+=f' | <a href="{entry["run_dir"]}/{review_dir}/review.html">字段核对</a>'
+            if backend=='adaptive' and entry['decision']=='target':
+                links+=f' | <a href="{entry["result_path"]}">产品JSON</a>'
+            else:
+                review_dir = 'submission_ocr' if entry['decision']=='submission' else 'ocr_draft'
+                links+=f' | <a href="{entry["run_dir"]}/{review_dir}/review.html">字段核对</a>'
         reasons=entry.get("reasons",[]) + [entry.get("extraction_status", ""),entry.get("extraction_error", ""),entry.get("error", "")]
         rows.append(f'<tr><td>{entry["page_no"]}</td><td>{html.escape(entry["decision"])}</td><td>{thumbnails}</td><td>{html.escape(str(reasons))}<br>{links}</td></tr>')
     (out/"index.html").write_text('<!doctype html><meta charset="utf-8"><title>整份PDF进场表筛选</title>'
@@ -256,4 +301,6 @@ if __name__ == "__main__":
     parser.add_argument("--device",default="gpu:0")
     parser.add_argument("--scan-dpi",type=int,default=180,choices=[150,180,200])
     parser.add_argument("--extract-draft",action="store_true",help="几何检查通过后自动OCR草稿，仍标记未人工确认")
+    parser.add_argument('--entry-backend',choices=['template','adaptive'],default='template')
+    parser.add_argument('--no-deskew',action='store_true',help='自适应模式跳过小角度纠偏，并标记复核')
     run(parser.parse_args())

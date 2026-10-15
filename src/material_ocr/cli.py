@@ -26,7 +26,7 @@ def parser():
         command.add_argument('--material', default='rebar')
         command.add_argument('--device', default='gpu:0')
         command.add_argument('--profile', choices=['batched_gpu', 'complete'], default='batched_gpu')
-        command.add_argument('--layout', default='auto', help='材料适配器支持的检验表版式；钢筋为auto/6_rows/11_rows')
+        command.add_argument('--layout', default='auto', help='材料适配器支持的检验表版式；钢筋为auto/6_rows/11_rows/adaptive')
         command.add_argument('--model-cache', type=Path, default=Path('models/paddlex_cache'))
         command.add_argument('--run-id')
     replay.add_argument('--records', type=Path, required=True)

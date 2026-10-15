@@ -8,6 +8,8 @@
 
 新增固定版式报审表四字段提取及重复候选，接入现有网页台账，详见 [报审表更新说明](docs/SUBMISSION_UPDATE.md)。第一阶段汇总新增 submission_forms / submission_duplicate_candidates；原进场表记录接口保持 records。
 
+新增可选的 **自适应进场表提取**：网页选择「自适应表格模型（钢筋）」，或命令行增加 `--layout adaptive`。复用原页面分类与报审首页流程，以单元格检测和 OCR 坐标配对替代固定进场表模板。原 `auto/6_rows/11_rows` 模式保持不变。运行方法、模型依赖和边界见 [自适应更新说明](docs/ADAPTIVE_TABLES.md)。
+
 ## 安装和启动
 
 在仓库根目录，使用现有 `ocr` conda 环境：
