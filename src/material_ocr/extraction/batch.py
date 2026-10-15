@@ -284,7 +284,7 @@ def run(args, *, progress=None):
         rows.append(f'<tr><td>{entry["page_no"]}</td><td>{html.escape(entry["decision"])}</td><td>{thumbnails}</td><td>{html.escape(str(reasons))}<br>{links}</td></tr>')
     (out/"index.html").write_text('<!doctype html><meta charset="utf-8"><title>整份PDF进场表筛选</title>'
         '<style>body{font-family:sans-serif;padding:24px}td,th{border:1px solid #ccc;padding:12px;vertical-align:top}table{border-collapse:collapse}</style>'
-        '<h1>页面筛选与提取草稿</h1><p>target=进场检验表；submission=报审表；other=其他明确标题；review/error必须复核。命中不保证模板适用，草稿不自动放行。</p>'
+        '<h1>页面筛选与提取草稿</h1><p>target=进场检验记录或进场数量清单；submission=报审表；other=其他明确标题；review/error必须复核。命中不保证模板适用，草稿不自动放行。</p>'
         f'<h2>报审表重复候选：{len(submission_duplicates)}组</h2><pre>{html.escape(str(submission_duplicates))}</pre>'
         '<table><tr><th>页码</th><th>判定</th><th>OCR页头证据</th><th>状态与链接</th></tr>'+''.join(rows)+'</table>',encoding="utf-8")
     print(f"target_pages={manifest['target_pages']}; submission_pages={manifest['submission_pages']}; review_pages={manifest['review_pages']}")
