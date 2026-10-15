@@ -13,16 +13,14 @@ import shutil
 import statistics
 import time
 from decimal import Decimal, InvalidOperation
+from datetime import date
 from pathlib import Path
+from material_ocr.materials.rebar.entry_schema import (
+    FIELD_ALIASES, OPTIONAL_ALIASES, compact, header_matches, parse_specification, quantity_header,
+)
+from material_ocr.materials.rebar.confidence import load_policy, field_confidence_decision
 
-ALIASES = {
-    "row_no": ("序号",),
-    "material_name": ("材料名称", "材料品名", "名称"),
-    "specification": ("规格型号", "规格"),
-    "quantity": ("进场数量", "进场量"),
-    "manufacturer": ("生产厂家", "生产单位"),
-    "certificate_no": ("质量证明书编号", "质量证明书号", "质证书编号", "质证书号", "合格证号"),
-}
+ALIASES = FIELD_ALIASES
 
 
 def write_json(path, data):
@@ -155,7 +153,7 @@ def assign_texts(cells, tokens, min_coverage=.80, min_margin=.15, min_score=.95)
     return matches
 
 
-def field_value(name, cell):
+def field_value(name, cell, header=None):
     raw = cell["raw_text"] if cell else ""
     text = normalize(raw)
     evidence = {"cell_id": cell["cell_id"], "cell_bbox": cell["bbox"], "grid": cell["grid"],
@@ -163,7 +161,10 @@ def field_value(name, cell):
                                for t in cell["tokens"]]} if cell else None
     issues = list(cell["issues"]) if cell else []
     value = text or None
-    if not text:
+    extra = {}
+    if not text and name in OPTIONAL_ALIASES:
+        pass
+    elif not text:
         issues.append("missing_text")
     elif name == "row_no":
         if re.fullmatch(r"[1-9]\d{0,4}", text):
@@ -172,14 +173,21 @@ def field_value(name, cell):
             value = None
             issues.append("invalid_row_no")
     elif name == "quantity":
-        found = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(t|T|吨|kg|KG|千克)", text)
-        if found:
+        found = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(t|T|吨|kg|KG|千克)?", text)
+        header_unit = quantity_header(header["raw_text"])[1] if header else None
+        explicit_unit = ("t" if found[2] in ("t", "T", "吨") else "kg") if found and found[2] else None
+        unit = explicit_unit or header_unit
+        if found and unit:
             try:
                 number = Decimal(found[1])
                 if number <= 0:
                     issues.append("nonpositive_quantity")
-                unit = "t" if found[2] in ("t", "T", "吨") else "kg"
                 value = {"value": str(number), "unit": unit}
+                extra["unit_source"] = "cell" if explicit_unit else "column_header"
+                if header_unit:
+                    extra["unit_header_evidence"] = field_value("header", header)["evidence"]
+                if explicit_unit and header_unit and explicit_unit != header_unit:
+                    issues.append("quantity_unit_conflicts_with_header")
             except InvalidOperation:
                 value = None
                 issues.append("invalid_quantity")
@@ -187,8 +195,19 @@ def field_value(name, cell):
             value = None
             issues.append("invalid_quantity_or_missing_unit")
     elif name == "specification":
-        if not re.fullmatch(r"(?:[ΦφØ⌀])?\d+(?:\.\d+)?(?:mm|MM|毫米)", text):
+        parsed = parse_specification(text)
+        if parsed is None:
             issues.append("specification_format_not_validated")
+        else:
+            extra["parsed"] = parsed
+    elif name == "entry_date":
+        found = re.fullmatch(r"(20\d{2})(?:年|/|-|\.)(\d{1,2})(?:月|/|-|\.)(\d{1,2})日?", text)
+        try:
+            value = date(*map(int, found.groups())).isoformat() if found else None
+        except ValueError:
+            value = None
+        if value is None:
+            issues.append("invalid_entry_date")
     elif name == "certificate_no":
         # Format checks only. No O->0 conversion, guessing or fixed factory lengths.
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9./_-]*", text) or not re.search(r"\d", text):
@@ -196,7 +215,7 @@ def field_value(name, cell):
     elif name == "material_name" and "钢筋" not in text:
         issues.append("material_not_validated_as_rebar")
     return {"value": value, "raw_text": raw, "lines": cell["lines"] if cell else [],
-            "evidence": evidence, "issues": sorted(set(issues))}
+            "evidence": evidence, "issues": sorted(set(issues)), **extra}
 
 
 def split_shared_cell(cell):
@@ -257,7 +276,8 @@ def isolated_dot_blank_evidence(related, fields, unresolved):
     OCR-empty, structurally complete row. A digit/letter is never noise here.
     This is a review candidate, not a claim that the source pixels are blank.
     """
-    if unresolved or not all(f["evidence"] is not None for f in fields.values()):
+    if unresolved or not all(f["evidence"] is not None or f.get("source_status") == "not_in_source"
+                             for f in fields.values()):
         return None
     pairs = [(cell, token) for cell in related for token in cell["tokens"]]
     if len(pairs) != 1:
@@ -277,28 +297,69 @@ def isolated_dot_blank_evidence(related, fields, unresolved):
                      "max_width_ratio": .10, "max_height_ratio": .15, "max_area_ratio": .01}}
 
 
-def assemble_records(cells, grid, matches):
+def assemble_records(cells, grid, matches, min_score=.95):
     issues = list(grid["issues"])
     headers = {}
+    serial_candidates = [c for c in cells if compact(c["raw_text"]) == "序号"]
+    # Title must precede the serial header, in this table's horizontal region.
+    # A missing certificate header on the OLD form is still an error.
+    quantity_list = False
+    if len(serial_candidates) == 1 and cells:
+        serial_y = serial_candidates[0]["bbox"][1]
+        left, right = min(c["bbox"][0] for c in cells), max(c["bbox"][2] for c in cells)
+        title_tokens = sorted([m for m in matches if m["ocr_score"] >= .90
+            and (m["bbox"][1]+m["bbox"][3])/2 < serial_y
+            and left <= (m["bbox"][0]+m["bbox"][2])/2 <= right],
+            key=lambda m: (m["bbox"][1], m["bbox"][0]))
+        quantity_list = any("进场数量清单" in "".join(compact(m["text"]) for m in title_tokens[i:i+3])
+                            for i in range(len(title_tokens)))
     for name, aliases in ALIASES.items():
-        found = [c for c in cells if c["normalized_text"] in aliases]
+        found = [c for c in cells if header_matches(name, c["raw_text"], aliases)]
+        if name == "certificate_no" and quantity_list and not found:
+            continue
         if len(found) != 1:
             issues.append(f"header_missing_or_ambiguous:{name}:{len(found)}")
         else:
             headers[name] = found[0]
-    if len(headers) != len(ALIASES) or grid["issues"]:
+    required = set(ALIASES) - ({"certificate_no"} if quantity_list else set())
+    if not required.issubset(headers) or issues:
         return [], [], headers, sorted(set(issues))
     # Header cells must overlap the serial header's vertical band.
     serial = headers["row_no"]["grid"]
     start, end = serial["row_start"], serial["row_end"]
+    header_warnings = {}
+    header_confidence = {}
+    confidence_policy = load_policy() if quantity_list else None
+    for name, aliases in OPTIONAL_ALIASES.items():
+        found = [c for c in cells if start <= c["grid"]["row_start"] and c["grid"]["row_end"] <= end
+                 and header_matches(name, c["raw_text"], aliases)]
+        if len(found) == 1:
+            headers[name] = found[0]
+        elif len(found) > 1:
+            issues.append(f"header_missing_or_ambiguous:{name}:{len(found)}")
     for name, cell in headers.items():
         g = cell["grid"]
         if g["row_start"] < start or g["row_end"] > end:
             issues.append(f"header_outside_serial_band:{name}")
         if cell["issues"]:
-            issues.append(f"unreliable_header:{name}")
+            decision = (field_confidence_decision(cell, 'quantity_header', 'entry_quantity_list',
+                        min_score, confidence_policy) if quantity_list and name == 'quantity' else None)
+            if decision:
+                header_confidence[name] = decision
+            elif quantity_list and all(i.startswith("low_ocr_score:") for i in cell["issues"]):
+                # Exact, unique label + valid geometry still permits a DRAFT.
+                # Confidence is not upgraded: warn on each affected row/field.
+                header_warnings[name] = list(cell["issues"])
+            else:
+                issues.append(f"unreliable_header:{name}")
     if issues:
         return [], [], headers, sorted(set(issues))
+
+    # Do not confuse an unreadable heading with an absent certificate column.
+    unknown_headers = [c["cell_id"] for c in cells
+        if start <= c["grid"]["row_start"] and c["grid"]["row_end"] <= end
+        and c["cell_id"] not in {h["cell_id"] for h in headers.values()}
+        and compact(c["raw_text"]) != "备注"]
 
     def same_columns(cell, header):
         g, h = cell["grid"], header["grid"]
@@ -338,7 +399,7 @@ def assemble_records(cells, grid, matches):
         row_issues = list(issues)
         fields = {}
         shared_cell = None
-        if same_columns(headers["manufacturer"], headers["certificate_no"]):
+        if "certificate_no" in headers and same_columns(headers["manufacturer"], headers["certificate_no"]):
             shared = [c for c in body if same_columns(c, headers["manufacturer"])
                       and c["grid"]["row_start"] == a["row_start"]
                       and c["grid"]["row_end"] == a["row_end"]]
@@ -365,9 +426,31 @@ def assemble_records(cells, grid, matches):
                         continue
                 candidates.append(cell)
             chosen = candidates[0] if len(candidates) == 1 else None
-            fields[name] = field_value(name, chosen)
+            fields[name] = field_value(name, chosen, header)
+            if name in header_warnings:
+                fields[name]["issues"].extend("header:"+i for i in header_warnings[name])
+                fields[name]["header_evidence"] = field_value("header", header)["evidence"]
+            if name in header_confidence:
+                fields[name]["header_confidence_decision"] = header_confidence[name]
+                fields[name]["header_evidence"] = field_value("header", header)["evidence"]
             if len(candidates) != 1:
                 fields[name]["issues"].append(f"cell_missing_or_ambiguous:{len(candidates)}")
+            if quantity_list and name == 'specification' and not any(
+                    not i.startswith('low_ocr_score:') for i in fields[name]['issues']):
+                decision = field_confidence_decision(chosen, 'specification', 'entry_quantity_list',
+                                                     min_score, confidence_policy)
+                if decision:
+                    fields[name]['confidence_decision'] = decision
+                    fields[name]['issues'] = [i for i in fields[name]['issues']
+                                             if i not in decision['resolved_issues']]
+        if "certificate_no" not in fields:
+            fields["certificate_no"] = {"value": None, "raw_text": "", "lines": [], "evidence": None,
+                "source_status": "header_not_detected" if unknown_headers else "not_in_source",
+                "extraction_method": "quantity_list_without_certificate_column",
+                "absence_basis": {"title_ocr_indices": [m["ocr_index"] for m in title_tokens],
+                                  "header_cell_ids": [h["cell_id"] for h in headers.values()],
+                                  "unrecognized_header_cell_ids": unknown_headers},
+                "issues": ["unrecognized_header_cannot_confirm_absence"] if unknown_headers else []}
         # Fail closed when unassigned text lies in this product's physical band.
         top = grid["y_edges"][a["row_start"]]
         bottom = grid["y_edges"][a["row_end"]]
@@ -393,6 +476,7 @@ def assemble_records(cells, grid, matches):
         for name, field in fields.items():
             row_issues.extend(f"{name}:{problem}" for problem in field["issues"])
         records.append({"record_id": f"{anchor['cell_id']}:product", "anchor_cell_id": anchor["cell_id"],
+                        "entry_form_type": "entry_quantity_list" if quantity_list else "inspection_record",
                         "grid_rows": [a["row_start"], a["row_end"]],
                         "row_no": fields["row_no"]["value"], "fields": fields,
                         "unresolved_ocr_indices": unresolved, "issues": sorted(set(row_issues)),
@@ -411,7 +495,7 @@ def analyze_candidate(table, tokens, options, table_index):
              for index, box in enumerate(table.get("cell_box_list", []))]
     matches = assign_texts(cells, tokens, options.min_coverage, options.min_margin, options.min_score)
     grid = recover_grid(cells)
-    records, blanks, headers, issues = assemble_records(cells, grid, matches)
+    records, blanks, headers, issues = assemble_records(cells, grid, matches, options.min_score)
     bounds = ([min(c["bbox"][0] for c in cells), min(c["bbox"][1] for c in cells),
                max(c["bbox"][2] for c in cells), max(c["bbox"][3] for c in cells)] if cells else None)
     for m in matches:
@@ -441,6 +525,9 @@ def analyze_candidate(table, tokens, options, table_index):
         record["source_table_candidate"] = table_index
     record_unresolved = {i for r in records for i in r["unresolved_ocr_indices"]}
     noise_blanks = sum(b.get("requires_review", False) for b in blanks)
+    accepted_tokens = {decision['ocr_index'] for r in records for f in r['fields'].values()
+                       for key in ('confidence_decision', 'header_confidence_decision')
+                       if (decision := f.get(key)) is not None}
     return {"schema_version": "coordinate_match_experiment_v2_1", "production_ready": False,
         "coordinate_system": "input_image_pixels; original PDF coordinates require render_meta offset",
         "profile": "rebar_explicit_headers_serial_anchor", "table_issues": issues,
@@ -463,6 +550,7 @@ def analyze_candidate(table, tokens, options, table_index):
             "noise_blank_candidate_count": noise_blanks,
             "blank_needs_review_count": noise_blanks,
             "needs_review_count": sum(r["status"] == "needs_review" for r in records),
+            "field_policy_accepted_token_count": len(accepted_tokens),
             "table_issue_count": len(issues),
             "status": "needs_review" if issues or noise_blanks or any(r["issues"] for r in records)
                       else "rule_pass_review_required" if records else "no_product_records"}}
@@ -531,6 +619,7 @@ def analyze(data, options):
         chosen["table_issues"] = blocked
         chosen["summary"].update(product_count=0, blank_candidate_count=0,
                                  noise_blank_candidate_count=0, blank_needs_review_count=0,
+                                 field_policy_accepted_token_count=0,
                                  needs_review_count=0, table_issue_count=len(blocked), status="needs_review")
         decision = "blocked_review_candidate_diagnostics"
     chosen["table_selection"] = {"candidate_count": len(candidates),
@@ -626,7 +715,8 @@ def main():
     parser.add_argument("--no-html", action="store_true", help="Export JSON only; no HTML/SVG is required for extraction")
     parser.add_argument("--min-coverage",type=float,default=.80)
     parser.add_argument("--min-margin",type=float,default=.15)
-    parser.add_argument("--min-score",type=float,default=.95)
+    parser.add_argument("--min-score",type=float,default=.95,
+                        help="General OCR threshold; nondefault values disable the quantity-list field exceptions")
     args = parser.parse_args()
     try:
         if args.out.exists():

@@ -25,6 +25,63 @@ LABELS = {'document_no': '文件编号', 'supply_date': '供货日期',
           'use_location': '使用部位', 'material_name': '材料名称'}
 
 
+def underline_candidates(binary, config, *, fragmented=False):
+    """Find ink-supported underlines; never synthesize missing whole fields.
+
+    The fallback merges only short gaps between collinear line fragments in
+    the body band. It changes geometry proposals, NOT the source OCR pixels.
+    """
+    if not fragmented:
+        horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((1, 90), np.uint8))
+        contours, _ = cv2.findContours(horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return [cv2.boundingRect(c) for c in contours]
+    w, h = config['frame_size']
+    pad = config['header_pad']
+    settings = config.get('fragmented_underlines', {})
+    minimum = settings.get('min_segment_px', 30)
+    gap = settings.get('max_gap_px', 24)
+    tolerance = settings.get('max_center_y_delta_px', 6)
+    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((1, minimum), np.uint8))
+    contours, _ = cv2.findContours(horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    segments = [cv2.boundingRect(c) for c in contours]
+    segments = [s for s in segments if s[2] >= minimum and s[3] < 20
+                and config['underline_y_range'][0] <= (s[1]-pad)/h <= config['underline_y_range'][1]]
+    groups = []
+    for segment in sorted(segments, key=lambda s: (s[0], s[1])):
+        x, y, ww, hh = segment
+        matches = [group for group in groups
+            if 0 <= x-max(s[0]+s[2] for s in group) <= gap
+            and max(abs(y+hh/2-(s[1]+s[3]/2)) for s in group) <= tolerance]
+        if len(matches) == 1:
+            matches[0].append(segment)
+        else:
+            groups.append([segment])
+    result = []
+    for group in groups:
+        x, y = min(s[0] for s in group), min(s[1] for s in group)
+        x2, y2 = max(s[0]+s[2] for s in group), max(s[1]+s[3] for s in group)
+        if sum(s[2] for s in group)/(x2-x) >= settings.get('min_ink_coverage', .85):
+            result.append((x,y,x2-x,y2-y))
+    return result
+
+
+def select_underlines(segments, endpoints, config):
+    w, h = config['frame_size']
+    pad = config['header_pad']
+    selected = {}
+    for field, (starts, ends) in endpoints.items():
+        matches = [(x,y,ww,hh) for x,y,ww,hh in segments
+            if starts[0] <= x/w <= starts[1] and ends[0] <= (x+ww)/w <= ends[1]
+            and config['underline_y_range'][0] <= (y-pad)/h <= config['underline_y_range'][1]
+            and hh < 20]
+        if len(matches) != 1:
+            return None
+        selected[field] = matches[0]
+    if len(selected) != 3 or np.ptp([s[1] for s in selected.values()]) > 24:
+        return None
+    return selected
+
+
 def locate_fields(image, config):
     """用整张报审表外框消除平移/缩放/轻微透视，再检测三条填写下划线。
 
@@ -55,31 +112,34 @@ def locate_fields(image, config):
         gray = cv2.cvtColor(rect, cv2.COLOR_BGR2GRAY)
         binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                        cv2.THRESH_BINARY_INV, 35, 15)
-        horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((1, 90), np.uint8))
-        lines, _ = cv2.findContours(horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        segments = [cv2.boundingRect(c) for c in lines]
+        segments = underline_candidates(binary, config)
         # 应有上下两个大签章区的分隔线；进场表/任意矩形不应套用此模板。
         separators = [(x, y, ww, hh) for x, y, ww, hh in segments
                       if ww > .90*w and .45 < (y-pad)/h < .78]
         if len(separators) != 1:
             continue
-        selected = {}
-        for field, (starts, ends) in config['underline_endpoints'].items():
-            matches = [(x, y, ww, hh) for x, y, ww, hh in segments
-                       if starts[0] <= x/w <= starts[1] and ends[0] <= (x+ww)/w <= ends[1]
-                       and config['underline_y_range'][0] <= (y-pad)/h <= config['underline_y_range'][1]
-                       and hh < 20]
-            if len(matches) != 1:
-                break
-            selected[field] = matches[0]
-        if len(selected) != 3 or np.ptp([s[1] for s in selected.values()]) > 24:
+        selected = select_underlines(segments, config['underline_endpoints'], config)
+        method = 'continuous_underlines'
+        if selected is None and config.get('fragmented_underlines'):
+            repaired = underline_candidates(binary, config, fragmented=True)
+            selected = select_underlines(repaired, config['fragmented_underlines']['endpoints'], config)
+            method = 'collinear_fragment_underlines'
+        if selected is None:
             continue
         boxes = {}
         for field, (x, y, ww, hh) in selected.items():
             inset = config['field_inset_px']
             boxes[field] = [x+inset, y-config['field_height_px'], x+ww-inset, y-2]
+            if method == 'collinear_fragment_underlines':
+                # Some printed dates end on the underline's endpoint. Limited
+                # right padding includes the glyph without the next form label.
+                boxes[field][2] = min(w, x+ww+config['fragmented_underlines'].get('right_padding_px', 12))
+                boxes[field][3] = y+hh+config['fragmented_underlines'].get('bottom_padding_px', 5)
         for field, key in [('document_no', 'document_no_box'), ('body_context', 'body_band')]:
-            x1, y1, x2, y2 = config[key]
+            region = config[key]
+            if method == 'collinear_fragment_underlines':
+                region = config['fragmented_underlines'].get(key, region)
+            x1, y1, x2, y2 = region
             boxes[field] = [round(x1*w), round(pad+y1*h), round(x2*w), round(pad+y2*h)]
         inverse = np.linalg.inv(matrix)
         page_polygons = {}
@@ -91,6 +151,7 @@ def locate_fields(image, config):
             page_polygons[field] = poly.tolist()
         if valid:
             candidates.append((rect, matrix, boxes, {'outer_quad_upright': (quad/scale).tolist(),
+                                'alignment_method': method,
                                 'underline_segments': selected, 'polygons_upright': page_polygons}))
     if len(candidates) != 1:
         raise ValueError(f'submission_alignment_unresolved:candidates={len(candidates)}; 请检查方向、外框和正文下划线')
@@ -153,6 +214,8 @@ def parse_field(field, raw, blocks, minimum_score=.95):
             issues.append('not_detected_requires_review')
         elif not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9./·•\-]*',value):
             issues.append('document_no_format_uncertain')
+        if value and value.endswith(('-', '/', '·', '•')):
+            issues.append('document_no_incomplete_or_prefix_only')
         # 当前模型无法保证手写编号准确，也不自动识别“确实未填写”。
         issues.append('document_no_visual_review_required')
     elif field == 'supply_date':

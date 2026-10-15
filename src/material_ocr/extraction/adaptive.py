@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from material_ocr.ocr.orientation import rotate_page
+from material_ocr.materials.rebar.entry_schema import parse_specification, OPTIONAL_ALIASES
 
 
 def save_json(path, value):
@@ -135,20 +136,28 @@ def attach_sources(result, folder, page_no, pdf_sha, calibration):
         record["manufacturer"] = fields["manufacturer"]["value"]
         record["certificate_no"] = fields["certificate_no"]["value"]
         spec = fields["specification"]["value"] or ""
-        found = re.fullmatch(r"[ΦφØ⌀]?(\d+(?:\.\d+)?)(?:mm|MM|毫米)", spec)
-        record["diameter_mm"] = found[1] if found else None
+        parsed = parse_specification(spec)
+        record["diameter_mm"] = parsed["diameter_mm"] if parsed else None
+        record["grade"] = parsed["grade"] if parsed else None
+        record["certificate_no_source_status"] = fields["certificate_no"].get(
+            "source_status", "extracted" if record["certificate_no"] else "not_detected")
+        for name in OPTIONAL_ALIASES:
+            if name in fields:
+                record[name] = fields[name]["value"]
         quantity = fields["quantity"]["value"]
         record["weight_t"] = (str(Decimal(quantity["value"])/(1000 if quantity["unit"] == "kg" else 1))
                               if isinstance(quantity, dict) and quantity["unit"] in ("t","kg") else None)
         for field in fields.values():
-            evidence = field.get("evidence")
-            if evidence:
-                evidence["rendered_page_polygon"] = original_polygon(evidence["cell_bbox"], calibration["input_to_original"])
+            for evidence_key in ("evidence", "unit_header_evidence", "header_evidence"):
+                evidence = field.get(evidence_key)
+                if evidence:
+                    evidence["rendered_page_polygon"] = original_polygon(evidence["cell_bbox"], calibration["input_to_original"])
         # Preserve the current workbench's inspection/ledger evidence contract.
         # Its polygons refer to the ORIGINAL rendered page, not calibrated input.
         aliases = {"row_no":"row_no", "material_name":"material_name",
                    "specification":"specification", "weight":"quantity",
                    "manufacturer":"manufacturer", "certificate_no":"certificate_no"}
+        aliases.update({name:name for name in OPTIONAL_ALIASES if name in fields})
         record["raw_cells"] = {name:fields[key]["raw_text"] for name,key in aliases.items()}
         record["effective_cells"] = dict(record["raw_cells"])
         record["source_cells"] = {}

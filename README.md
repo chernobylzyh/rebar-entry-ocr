@@ -113,6 +113,29 @@ python -m material_ocr --help
 
 ## 文档与交接
 
+### 只测试上游分类和进场表提取
+
+不需要附件 OCR、四表匹配时，直接运行现有的 inspection 阶段（输出目录须为新目录）：
+
+```bash
+python -m material_ocr.worker inspection --pdf data/input.pdf --out runs/inspection_only --device gpu:0 --model-cache models/paddlex_cache --layout adaptive
+```
+
+该命令逐页分类、提取报审表，并对目标进场表校准后使用表格模型和 OCR 配对，**不会调用附件识别或下游匹配**。
+`page_index.json` 查看页码与分类证据，`records_all_pages.json` 的 `records` 数组是进场产品数据；报审表另存 `submission_forms.json`。
+
+本次三份样本的 AutoDL 复测可使用 `python autodl_test_three.py --data-dir /path/to/pdf_folder`。
+目录中需有 `0814钢筋01.pdf`、`0814钢筋02.pdf`、`2025.12.6日钢筋报审表.pdf`。
+脚本串行运行上游阶段，默认复用 `/root/.paddlex` 缓存，创建新的时间戳输出目录，记录每份耗时并生成 `results_for_review.zip`（JSON 和日志，不含扫描图片）。不会覆盖旧结果。安装本项目后使用；`--dry-run` 仅检查输入并展示命令。
+
+- 自适应模式同时支持明确的“进场检验记录”和“进场数量清单”标题，并要求序号、规格、数量和材料/厂家表头证据。不是任意标题命中即放行。
+- 保留原有 `row_no/material_name/manufacturer/diameter_mm/weight_t/certificate_no` 字段和坐标证据。规格支持 `HRB400E Φ10`，另存 `grade`；数量可从 `进场数量(t)` 表头继承单位，保留单位表头证据，不默认猜吨。
+- 数量清单确无证书号列时，`certificate_no=null`、`certificate_no_source_status=not_in_source`，不阻止其他字段输出；另提取存在的 `entry_date/use_location/self_check_result`。有证书列却读不出内容、表头不明、单位冲突仍保留复核标记。
+- 数量清单采用有限的分字段置信度规则（`materials/rebar/config/entry_confidence.json`）：通用阈值仍为 0.95；仅对含明确单位的数量表头、能完整解析出牌号和正直径的规格，允许 0.90。还必须满足单个 OCR 文本框、归属唯一、覆盖率不低于 0.98、候选覆盖率差不低于 0.50。重量数值、编号、厂家等不放宽；低于 0.90、单位冲突、缺失、结构或校准不确定仍复核。只改变是否触发告警，不修改原文或原始分数，依据分别保存在字段的 `header_confidence_decision` / `confidence_decision`。这不是准确率保证；通过后状态与旧样本正常记录一致为 `rule_pass_review_required`，仍不是人工确认。
+- B.0.6 报审表优先沿用原有连续填写线定位；失败时，在校准后的表框内尝试合并短小、近似共线的断线，并要求日期、使用部位、材料名称三个区域均能唯一定位。兼容日期填写区偏左、使用部位多行的版式；缺线或多个候选仍报定位失败，不用固定位置硬猜。编号仅有前缀时保留原文并标注复核，不补造编号。
+- `ready_for_search=false` 和草稿复核状态继续保留，不代表 OCR 已经人工确认。新增类型请使用 `--layout adaptive`；旧固定坐标模板没有扩展。
+- 本更新不扩展无证书号情况下的下游关联；网页完整流程依然包含附件和匹配，不适合作为“只测上游”的入口。
+
 |文档|用途|
 |---|---|
 |[完整流程](docs/WORKFLOW.md)|各阶段输入 / 输出、匹配规则、两步审核和导出|
