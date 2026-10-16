@@ -293,6 +293,8 @@ def heat_anchor(blocks, heat):
 
 def plate_scope(page, candidate, peers):
     blocks = page_blocks(page, candidate)
+    if str(candidate.get('entity_key', '')).startswith('card-'):
+        return blocks, []
     heats = candidate.get('heat_lots', [])
     if len(heats) != 1:
         return [], ['铭牌炉批号未唯一定位，请按原图补正字段。']

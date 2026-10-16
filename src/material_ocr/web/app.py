@@ -97,11 +97,13 @@ def create_app(data_dir=Path('runs/web'), *, model_cache=Path('models/paddlex_ca
 
     app = FastAPI(title='材料表单OCR', lifespan=lifespan)
     app.state.tasks = service
+    from .library import create_library_router
+    app.include_router(create_library_router(data_dir, model_cache, device, profile))
     app.mount('/static', StaticFiles(directory=STATIC), name='static')
 
     @app.get('/')
     def home():
-        return FileResponse(STATIC / 'index.html')
+        return {'service': 'material-ocr', 'frontend': '前端/vue', 'docs': '/docs'}
 
     @app.get('/api/materials')
     def materials():

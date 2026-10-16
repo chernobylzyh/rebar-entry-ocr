@@ -57,7 +57,8 @@ def main_region(page):
     pref = [r for r in page.get('regions', []) if r.get('region_id', '').startswith(f'p{page_no:03d}_full')]
     if pref:
         return max(pref, key=lambda r: (len(r.get('blocks', [])), len(r.get('text', ''))))
-    return max(page.get('regions', []), key=lambda r: (len(r.get('blocks', [])), len(r.get('text', ''))))
+    return max(page.get('regions', []), key=lambda r: (len(r.get('blocks', [])), len(r.get('text', ''))),
+               default=dict(region_id=f'p{page_no:03d}_full', blocks=[], text='', entity_key='full'))
 
 
 def bbox(block):
@@ -172,7 +173,6 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
     index = json.loads(args.index.read_text())
     records = json.loads(args.records.read_text())
     assert hashlib.sha256(args.pdf.read_bytes()).hexdigest() == index['pdf_sha256'] == records['pdf_sha256']
-    assert records['records'], 'No inspection records; extraction must be resolved before matching'
     from material_ocr.ocr.attachments import build_regions, classify_page_text
     from material_ocr.ocr.layout import split_entities
     for page in index['pages']:
@@ -188,6 +188,12 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
     catalog = build_keyword_catalog(index, rules)
     recall_plate_fields(index, catalog)
     classification = classify(index, catalog['items'])
+    for record in records['records']:
+        if record.get('extraction_backend') == 'quantity_list_spatial_v1':
+            page_no = record['page_no']
+            category = classification['metrics']['category_pages']['inspection_record']
+            if page_no not in category:
+                category.append(page_no)
     roles = classification['metrics']['category_pages']
     # The raw index stays read-only. Exclude false certificate/plate sources by page class.
     catalog['items'] = [c for c in catalog['items'] if c['page_no'] in roles.get(c['role'], [])]
@@ -255,6 +261,8 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
             inspection_evidence=inspection_evidence,
             submission_forms=records.get('submission_forms', []),
             submission_duplicates=records.get('submission_duplicate_candidates', []))
+        from .automatic import build_automatic_ledger
+        build_automatic_ledger(result, index, catalog['items'], records)
     return build(args.output, inputs=inputs, pdf=args.pdf, base=args.index.parent,
                  matcher=rematch, matching_options=matching_options, result_enricher=enrich)
 

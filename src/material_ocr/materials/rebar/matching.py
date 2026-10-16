@@ -20,7 +20,7 @@ def heat_valid(value):
     value = norm(value)
     if re.match(r'^(?:HRB|HRBF|HPB|RRB|CRB)', value):
         return False
-    return bool(re.fullmatch(r"(?:\d{6,12}|[A-Z]{1,4}[-/]?\d{5,}[A-Z0-9]*|[A-Z]\d[-/]\d{5,}[A-Z0-9]*|[A-Z]{1,4}[-/]\d{2}[-/]\d{4,}[A-Z0-9]*)", value))
+    return bool(re.fullmatch(r"(?:\d{6,12}|\d{4,}[A-Z]\d{3,}[A-Z0-9]*(?:-\d+)?|[A-Z]{1,4}[-/]?\d{5,}[A-Z0-9]*|[A-Z]\d[-/]\d{5,}[A-Z0-9]*|[A-Z]{1,4}[-/]\d{2}[-/]\d{4,}[A-Z0-9]*)", value))
 
 
 def same_number(a, b):
@@ -269,10 +269,11 @@ def manual_inventory(role, pages, catalog, identifiers, entries):
         merged = {}
         for c in result:
             heat = norm(c['heat_lots'][0]).rstrip('.。') if c['heat_lots'] else None
-            key = (c['page_no'], heat) if heat else (c['page_no'], c['entity_key'])
+            physical = str(c.get('entity_key', '')).startswith('card-')
+            key = (c['page_no'], c['entity_key']) if physical else ((c['page_no'], heat) if heat else (c['page_no'], c['entity_key']))
             if key not in merged:
                 merged[key] = c
-                c['candidate_id'] = f'nameplate:{c["page_no"]}:{heat or c["entity_key"] or "page-only"}'
+                c['candidate_id'] = f'nameplate:{c["page_no"]}:{c["entity_key"] if physical else heat or c["entity_key"] or "page-only"}'
                 c['entity_keys'] = [c['entity_key']]
             else:
                 target = merged[key]

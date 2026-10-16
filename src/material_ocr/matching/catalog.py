@@ -197,7 +197,7 @@ def build_keyword_catalog(index: Mapping[str, Any], rules: Mapping[str, Any] | N
                 'delivery_note': ('quantity_t',)}
     for region in _iter_regions(index, rules or index.get("rules")):
         role = region.get("document_type")
-        if role not in fields or region.get("layout_role") in {"field_focus", "table_container"}:
+        if role not in fields or region.get("layout_role") in {"field_focus", "table_container", "page_evidence"}:
             continue
         form_key = (role, region.get('page_no'), region.get('entity_key', 'full'), region.get('row_id'))
         form = forms.setdefault(form_key, {'role': role, 'page_no': region.get('page_no'),

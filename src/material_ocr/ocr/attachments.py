@@ -712,6 +712,8 @@ def build_index_from_pages(pages: Iterable[Mapping[str, Any]], *, pdf_sha256: st
             "ocr_status": page.get("ocr_status", "completed"),
             "error_type": page.get("error_type"),
             "performance": page.get('performance'),
+            "pixel_size": page.get('pixel_size'), "dpi": page.get('dpi'),
+            "upright_image": page.get('upright_image'),
         })
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1210,9 +1212,21 @@ def _ocr_pages_worker(payload: Mapping[str, Any]) -> list[dict]:
                     regions.extend(_build_spec_regions(spec, page_no=page_no,
                                                        source_image=str(original_path.relative_to(out_path)),
                                                        rotation_ccw=rotation, rules=rules))
+                from .nameplates import physical_regions
+                cards = physical_regions(engine, image, blocks, page_no, image_dir,
+                                         original_shape, rotation, rules)
+                if cards:
+                    # Full-page/crop OCR remains evidence, but cannot pool card fields.
+                    for region in regions:
+                        if region.get('document_type') == 'nameplate' or region.get('entity_role') == 'nameplate':
+                            region.update(match_eligible=False, layout_role='page_evidence')
+                    for card in cards:
+                        card['source_image'] = str(original_path.relative_to(out_path))
+                    regions.extend(cards)
                 pages.append({"page_no": page_no, "classification": page_type,
                               "document_type": detected_type,
                               "rotation_ccw": rotation,
+                              "pixel_size": [original_shape[1], original_shape[0]], "dpi": int(payload['dpi']),
                               "source_image": str(original_path.relative_to(out_path)),
                               "upright_image": str(ocr_path.relative_to(out_path)),
                               "preprocessing_order": "orientation_then_ocr",
