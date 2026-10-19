@@ -7,6 +7,7 @@ from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 import re
+import unicodedata
 
 
 def norm(value):
@@ -28,6 +29,65 @@ def same_number(a, b):
         return Decimal(str(a)) == Decimal(str(b))
     except InvalidOperation:
         return False
+
+
+# Delivery OCR can prepend a spurious digit to the strength class, e.g.
+# ``HRB400E`` -> ``1级B3400E``. Read each grade number from right to left, but
+# retain its literal text and reject conflicting classes. This helper is only
+# a delivery comparison key; entry/nameplate and ID joins remain strict.
+_GRADE_NUMBER_RE = re.compile(r'(?<![0-9])(235|300|335|400|500|600|700)(?![0-9])')
+_GRADE_CLASSES = frozenset(('235', '300', '335', '400', '500', '600', '700'))
+
+
+def grade_numeric_details(value):
+    """Describe a unique strength class and any ignored leading OCR digits.
+
+    A long digit run must follow alphabetic grade text; a bare ``3400`` or a
+    weight cannot supply a repaired grade. Only its rightmost three digits
+    may be used, and another recognized strength anywhere in the same run
+    makes it conflicting. Thus ``HRB3400E`` or ``1级B3400E`` yields 400,
+    while a bare ``B3400E`` has no accepted grade prefix and remains
+    unresolved; ``B400500E`` and separate 400/500 observations also remain
+    unresolved. Original OCR is never rewritten by this comparison operation.
+    """
+    text = unicodedata.normalize('NFKC', str(value or '')).upper()
+    numbers, ignored = set(_GRADE_NUMBER_RE.findall(text)), []
+    for match in re.finditer(r'[0-9]{4,}', text):
+        digits = match.group()
+        prefix = re.search(r'(?:[0-9]级)?[A-Z]{1,8}$', text[:match.start()])
+        # Extra digit removal needs a grade-like prefix, never an invoice or
+        # heat identifier that happens to end in 400/500. Short OCR variants
+        # observed in these handwritten cells retain B (HBE, IRB, 1级B).
+        valid_prefix = bool(prefix and re.fullmatch(
+            r'(?:HRBF|HRB|HPB|RRB|CRB|HBE|IRB)', prefix.group()))
+        valid_prefix = valid_prefix or bool(re.search(r'[0-9]级B$', text[:match.start()]))
+        if len(digits) > 8 or not valid_prefix:
+            continue
+        strength = digits[-3:]
+        if strength not in _GRADE_CLASSES:
+            continue
+        observed = {digits[i:i+3] for i in range(len(digits)-2)} & _GRADE_CLASSES
+        if observed != {strength}:
+            return dict(numeric_key=None, ignored_leading_digits=[])
+        numbers.add(strength)
+        ignored.append(dict(raw_digits=digits, ignored_prefix=digits[:-3], strength_digits=strength))
+    key = next(iter(numbers)) if len(numbers) == 1 else None
+    return dict(numeric_key=key, ignored_leading_digits=ignored if key else [])
+
+
+def grade_numeric_key(value):
+    """Return the unique recognized numeric grade class in *value*.
+
+    ``HRB500E``, ``HBE500E`` and ``1级B500E`` all yield ``"500"``.  The
+    leading level number in the last OCR form is ignored. ``1级B3500E`` also
+    yields ``"500"`` by reading the numeric grade from its right end. Missing
+    or conflicting classes return ``None`` and cannot establish a match.
+    """
+    return grade_numeric_details(value)['numeric_key']
+
+
+# Descriptive alias for callers that make the route decision themselves.
+grade_number = grade_numeric_key
 
 
 def observations(items, role, field, allowed_pages):

@@ -21,7 +21,18 @@ request.interceptors.response.use(
     return { code: 200, data }
   },
   error => {
-    const msg = (error.response && error.response.data && error.response.data.msg) || error.message
+    const body = error.response && error.response.data
+    // Axios may throw a JSON parsing SyntaxError when Spring rejects a CORS
+    // preflight with its plain-text "Invalid CORS request" response.  Prefer
+    // the server's actionable message so the user is not shown the parser
+    // exception (and keep the original error for callers that need status).
+    let msg = body && typeof body === 'object' ? body.msg : ''
+    if (!msg && typeof body === 'string' && body.trim()) {
+      msg = body.trim() === 'Invalid CORS request'
+        ? '服务端跨域配置拒绝了请求，请重启更新后的 Java 服务后重试'
+        : body.trim()
+    }
+    msg = msg || error.message
     ElMessage.error(msg || '网络错误')
     return Promise.reject(error)
   }

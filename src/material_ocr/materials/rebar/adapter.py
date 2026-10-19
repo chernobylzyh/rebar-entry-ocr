@@ -20,7 +20,8 @@ class RebarAdapter(MaterialAdapter):
 
     def fingerprint(self):
         digest = hashlib.sha256()
-        for name in ['material.json', self.config['attachment_rules'], 'submission_b06.json', *self.config['inspection_templates']]:
+        for name in ['material.json', self.config['attachment_rules'], 'submission_b06.json',
+                     'entry_confidence.json', *self.config['inspection_templates']]:
             digest.update(rebar_config(name).read_bytes())
         return digest.hexdigest()
 
@@ -36,8 +37,14 @@ class RebarAdapter(MaterialAdapter):
         manifest = json.loads(page_index.read_text())
         records = inspection / 'records_all_pages.json'
         failures = inspection_failures(manifest)
-        extraction_issues = [dict(code='inspection_extraction_failed', page_no=p,
-                                 reason='检验表几何定位或提取未通过') for p in failures]
+        extraction_issues = []
+        for page in manifest['pages']:
+            if page['page_no'] not in failures:
+                continue
+            error = page.get('extraction_error')
+            reason = ('进场表提取失败：' + error) if error else '进场表几何定位或字段提取未通过，需核对原页'
+            extraction_issues.append(dict(code='inspection_extraction_failed', page_no=page['page_no'],
+                reason=reason, locations=[dict(page_no=page['page_no'], source_role='inspection', polygon_page=None)]))
         progress('attachments', 0, len(manifest['pages']), '识别附件与重点字段')
         rules = load_rules(rebar_config(self.config['attachment_rules']))
         rules['ocr_runtime'].update(profile=options.ocr_profile,

@@ -6,6 +6,28 @@ import re
 from material_ocr.materials.rebar.parsing import parse_weight
 
 
+def _structured_quantity_unit(record, raw):
+    """Use a mass unit only from this quantity cell's explicit saved header."""
+    quantity = record.get('fields', {}).get('quantity') or {}
+    parsed = quantity.get('value')
+    if (not isinstance(parsed, dict) or quantity.get('issues') or
+            quantity.get('unit_source') != 'column_header' or
+            re.sub(r'\s+','',quantity.get('raw_text','')) != re.sub(r'\s+','',raw)):
+        return None, None
+    header = quantity.get('unit_header_evidence') or quantity.get('header_evidence') or {}
+    texts = [str(token.get('text','')) for token in header.get('ocr_tokens', [])]
+    units = {'t':'t','吨':'t','kg':'kg','公斤':'kg','千克':'kg'}
+    declared = units.get(str(parsed.get('unit','')).lower())
+    if not declared:
+        return None, None
+    for text in texts:
+        match = re.fullmatch(r'(?:进场数量|验收数量|到货数量|数量|重量)[（(](t|吨|kg|公斤|千克)[）)]',
+                             re.sub(r'\s+','',text),re.I)
+        if match and units[match.group(1).lower()] == declared:
+            return declared, deepcopy(header)
+    return None, None
+
+
 def inspection_fields(record, record_id, evidence=None):
     from material_ocr.materials.rebar.filling import decimal_text, field
     effective = record.get('effective_cells', record.get('raw_cells', {}))
@@ -19,7 +41,14 @@ def inspection_fields(record, record_id, evidence=None):
     ev['raw_unit'] = unit.group(1).lower() if unit else None
     candidates, warnings = [], []
     if raw:
-        value, error = parse_weight(raw)
+        parse_raw = raw
+        if not unit:
+            header_unit, header_evidence = _structured_quantity_unit(record,raw)
+            if header_unit:
+                parse_raw = raw+header_unit
+                ev.update(raw_unit=header_unit,unit_source='column_header',
+                          unit_header_evidence=header_evidence)
+        value, error = parse_weight(parse_raw)
         if error:
             warnings.append('检验记录进场数量无法解析或缺少单位，请核对原图。')
         else:

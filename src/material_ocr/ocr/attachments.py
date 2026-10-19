@@ -21,6 +21,7 @@ from decimal import Decimal, InvalidOperation
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from material_ocr.storage_artifacts import register_derivative
 
 
 SCHEMA_VERSION = "phase2-attachment-index-v1"
@@ -854,7 +855,7 @@ def focused_fields_complete(template, specs, rules=None):
 
 
 def _verify_attachment_orientation(engine, original, rotation_hint: int,
-                                   out_dir: Path, stem: str) -> tuple:
+                                   out_dir: Path, stem: str, *, source_image=None) -> tuple:
     """Evaluate all four directions on a thumbnail before applying templates.
 
     An ambiguous direction is preserved as a review condition. No deskew is
@@ -868,6 +869,9 @@ def _verify_attachment_orientation(engine, original, rotation_hint: int,
         image = _rotate_for_ocr(preview, angle)
         path = out_dir / f"{stem}_direction_{angle}.png"
         cv2.imwrite(str(path), image)
+        if source_image:
+            register_derivative(path, source_image,
+                [{'resize': {'scale': scale}}, {'rotate': angle}], kind='direction_preview')
         blocks = _ocr_blocks(engine, image, path)
         attempts.append({"rotation_ccw": angle, "score": orientation_score(blocks),
                          "block_count": len(blocks), "preview_path": str(path)})
@@ -909,6 +913,9 @@ def _fragmented_ocr_blocks(engine, image, image_path: Path, out_dir: Path,
                 crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
             tile_path = out_dir / f"{image_path.stem}_tile_{row}_{col}.png"
             cv2.imwrite(str(tile_path), crop)
+            register_derivative(tile_path, image_path,
+                [{'crop': [x0, y0, x1, y1]},
+                 {'resize': {'scale': scale, 'interpolation': 'INTER_CUBIC'}}], kind='fragmented_tile')
             for block in _ocr_blocks(engine, crop, tile_path):
                 poly = block.get("polygon_page")
                 if poly:
@@ -979,6 +986,9 @@ def _template_ocr_regions(engine, image, image_path: Path, out_dir: Path,
         crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         crop_path = out_dir / f"{image_path.stem}_{name}.png"
         cv2.imwrite(str(crop_path), crop)
+        register_derivative(crop_path, image_path,
+            [{'crop': [px0, py0, px1, py1]},
+             {'resize': {'scale': scale, 'interpolation': 'INTER_CUBIC'}}], kind='field_or_region_crop')
         blocks = _ocr_blocks(engine, crop, crop_path)
         for block in blocks:
             poly = block.get("polygon_page")
@@ -1125,7 +1135,7 @@ def build_region_index_from_existing(index_path: str | Path, out: str | Path, *,
             if original_image is not None:
                 image, rotation, direction = _verify_attachment_orientation(
                     engine, original_image, int(page.get("rotation_ccw", 0) or 0),
-                    image_dir, f"page_{int(page['page_no']):03d}")
+                    image_dir, f"page_{int(page['page_no']):03d}", source_image=image_path)
                 ocr_path = image_dir / f"page_{int(page['page_no']):03d}_upright.png"
                 cv2.imwrite(str(ocr_path), image)
                 page = {**page, 'rotation_ccw': rotation,
@@ -1188,7 +1198,7 @@ def _ocr_pages_worker(payload: Mapping[str, Any]) -> list[dict]:
                 original_path = image_dir / f"page_{page_no:03d}.png"
                 cv2.imwrite(str(original_path), image)
                 image, rotation, direction = _verify_attachment_orientation(
-                    engine, image, rotation, image_dir, f"page_{page_no:03d}")
+                    engine, image, rotation, image_dir, f"page_{page_no:03d}", source_image=original_path)
                 ocr_path = image_dir / f"page_{page_no:03d}_upright.png"
                 cv2.imwrite(str(ocr_path), image)
                 page_type = hint.get("document_type") or hint.get("decision")

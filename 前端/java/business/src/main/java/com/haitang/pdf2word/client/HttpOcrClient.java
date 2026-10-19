@@ -94,6 +94,12 @@ public class HttpOcrClient {
         return parseJson(response.getBody());
     }
 
+    public JSONObject ocrModels() {
+        ResponseEntity<String> response = restTemplate.exchange(ocr.getBaseUrl() + "/api/library/ocr-models",
+                HttpMethod.GET, HttpEntity.EMPTY, String.class);
+        return parseJson(response.getBody());
+    }
+
     public JSONObject libraryList() {
         String url = ocr.getBaseUrl() + "/api/library";
         ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, HttpEntity.EMPTY, String.class);
@@ -179,6 +185,22 @@ public class HttpOcrClient {
         return parseJson(response.getBody());
     }
 
+    /** 提交快速返回的整卷任务；重试/刷新先查询状态，不重复启动耗时POST。 */
+    public JSONObject startLibraryRecognition(String pdfName, String prompt, String ocrPrompt,
+                                               String model, boolean forceOcrRefresh) {
+        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
+        if (StringUtils.isNotBlank(prompt)) form.add("prompt", prompt);
+        if (StringUtils.isNotBlank(ocrPrompt)) form.add("ocr_prompt", ocrPrompt);
+        if (StringUtils.isNotBlank(model)) form.add("model", model);
+        if (forceOcrRefresh) form.add("force_ocr_refresh", "true");
+        return parseJson(postFormWithRetry(ocr.getBaseUrl() + "/api/library/" + encode(pdfName) + "/recognition", form).getBody());
+    }
+
+    public JSONObject getLibraryRecognition(String pdfName) {
+        java.net.URI uri = java.net.URI.create(ocr.getBaseUrl() + "/api/library/" + encode(pdfName) + "/recognition");
+        return parseJson(restTemplate.exchange(uri, HttpMethod.GET, HttpEntity.EMPTY, String.class).getBody());
+    }
+
     public JSONObject clearLibraryCache(String pdfName, String scope) {
         MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
         form.add("scope", scope);
@@ -205,30 +227,20 @@ public class HttpOcrClient {
     }
 
     private ResponseEntity<String> postFormWithRetry(String url, MultiValueMap<String, String> form) {
-        int max = Math.max(0, ocr.getRetry()) + 1;
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
         HttpEntity<MultiValueMap<String, String>> entity = new HttpEntity<>(form, headers);
-        Exception last = null;
-        for (int i = 0; i < max; i++) {
-            try {
-                return restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
-            } catch (Exception e) {
-                last = e;
-                log.warn("调用 OCR 接口失败，重试 {} / {} -> {}", i + 1, max, e.getMessage());
-                try {
-                    Thread.sleep(500L * (i + 1));
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+        try {
+            return restTemplate.exchange(java.net.URI.create(url), HttpMethod.POST, entity, String.class);
+        } catch (Exception e) {
+            // A timeout does not mean an OCR/rotate/cache operation was rejected.
+            // The caller can recover through GET recognition without starting it again.
+            throw new BizException("调用 OCR 失败: " + e.getMessage());
         }
-        throw new BizException("调用 OCR 失败: " + (last == null ? "" : last.getMessage()));
     }
     private static String encode(String s) {
         try {
-            return java.net.URLEncoder.encode(s, java.nio.charset.StandardCharsets.UTF_8.name());
+            return java.net.URLEncoder.encode(s, java.nio.charset.StandardCharsets.UTF_8.name()).replace("+", "%20");
         } catch (java.io.UnsupportedEncodingException e) {
             return s;
         }
@@ -262,6 +274,7 @@ public class HttpOcrClient {
                 return restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
             } catch (Exception e) {
                 last = e;
+                if (e instanceof org.springframework.web.client.HttpClientErrorException) break;
                 log.warn("调用 OCR 接口失败，重试 {} / {} -> {}", i + 1, max, e.getMessage());
                 try {
                     Thread.sleep(500L * (i + 1));

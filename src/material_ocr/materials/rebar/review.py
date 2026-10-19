@@ -67,12 +67,64 @@ def bbox(block):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def recall_joined_certificate_heats(index, catalog):
+    """Split exact heat+grade OCR only below its own table headers.
+
+    Keep the merged polygon; never repair characters, invent a sub-box,
+    consult another region or accept an unlabelled identifier.
+    """
+    joined = re.compile(r'([A-Z0-9][A-Z0-9./-]{4,}?)((?:HRBF?|HPB|RRB|CRB)\d{3,4}(?:E|B)?)', re.I)
+    heat_label = re.compile(r'^(?:炉批号|批号|炉号|HEATNO|BATCHNO)[:：.]?$', re.I)
+    grade_label = re.compile(r'^(?:牌号|STEELGRADE|GRADE)[:：.]?$', re.I)
+    for page in index.get('pages', []):
+        if page.get('document_type') != 'quality_certificate':
+            continue
+        for region in page.get('regions', []):
+            if region.get('document_type', page['document_type']) != 'quality_certificate':
+                continue
+            blocks = [b for b in region.get('blocks', []) if b.get('polygon_page')]
+            heats = [b for b in blocks if heat_label.fullmatch(norm(b.get('text')))]
+            grades = [b for b in blocks if grade_label.fullmatch(norm(b.get('text')))]
+            for label in heats:
+                x0, y0, x1, y1 = bbox(label)
+                h = max(1, y1-y0); hx=(x0+x1)/2; hy=(y0+y1)/2
+                peers = [b for b in grades if bbox(b)[0] > x1 and
+                         abs((bbox(b)[1]+bbox(b)[3])/2-hy) <= h*.75]
+                if len(peers) != 1:
+                    continue
+                peer = peers[0]; gx0, gy0, gx1, gy1 = bbox(peer); gx=(gx0+gx1)/2
+                for block in blocks:
+                    match = joined.fullmatch(norm(block.get('text')))
+                    if (not match or not heat_valid(match.group(1)) or
+                            re.search(r'(?:HRBF?|HPB|RRB|CRB)\d',match.group(1),re.I) or
+                            re.match(r'XK\d',match.group(1),re.I)):
+                        continue
+                    bx0, by0, bx1, by1 = bbox(block)
+                    if not (y1 < by0 <= y1+h*8 and bx0 <= hx <= bx1 and
+                            bx0 <= gx <= bx1 and bx1 <= gx1+h*.75 and bx0 >= x0-h*2):
+                        continue
+                    value = match.group(1)
+                    ev = dict(page_no=page['page_no'], region_id=region['region_id'],
+                        polygon_page=deepcopy(block['polygon_page']), raw_text=block.get('text'),
+                        source_image=page.get('source_image'), rotation_ccw=page.get('rotation_ccw',0),
+                        label_raw_text=label.get('text'), label_polygon_page=deepcopy(label['polygon_page']),
+                        grade_label_raw_text=peer.get('text'), grade_label_polygon_page=deepcopy(peer['polygon_page']),
+                        method='same_table_joined_heat_grade', matched_heat_text=value,
+                        matched_grade_text=match.group(2), polygon_scope='original_merged_heat_and_grade_block')
+                    catalog['items'].append(dict(role='quality_certificate',field='heat_lot_no',
+                        page_no=page['page_no'],region_id=region['region_id'],entity_key=region.get('entity_key','full'),
+                        row_id=None,accepted=True,status='labelled_joined_table_observation',
+                        normalized_value=value,raw_value=value,ocr_raw_value=block.get('text'),
+                        value_evidence=ev,value_evidence_refs=[deepcopy(ev)]))
+    catalog['item_count'] = len(catalog['items'])
+
+
 def certificate_identifiers(index, allowed_pages):
     """Recall identifier values only beside explicit certificate number labels."""
     # Manufacturer forms use both Chinese labels and ``No.``/``No:``.
     # Chinese explicit labels remain preferred. Generic No labels require a
     # certificate-number format, excluding licence/template numbers.
-    labels = re.compile(r'(?:质量证明书编号|质保书编号|质编号|证明书号|(?<![A-Z])NO)\s*[.:：]?\s*', re.I)
+    labels = re.compile(r'(?:质量证明书编号|质保书编号|证书编号|质编号|证明书号|(?<![A-Z])NO)\s*[.:：]?\s*', re.I)
     valid = lambda s: bool(re.fullmatch(r'[A-Z0-9][A-Z0-9._/-]{2,}', norm(s)) and re.search(r'\d', norm(s)))
     found = []
     for pg in index['pages']:
@@ -166,6 +218,96 @@ def classify(index, catalog):
                 status='pending_user_review', metrics=dict(category_pages=categories, page_count=len(pages)), pages=pages)
 
 
+def refresh_cached_quantity_lists(index, saved_records):
+    """Apply today's list parser to cached OCR without overwriting its inputs.
+
+    Inspection/template backends remain authoritative on their own pages.
+    Missing rows and failed parses preserve the prior observation with a
+    diagnostic instead of silently losing an arrival-quantity record.
+    """
+    from .quantity_list import extract_quantity_lists
+    backend = 'quantity_list_spatial_v1'
+    records = deepcopy(saved_records)
+    original = records.get('records', [])
+    other = [r for r in original if r.get('extraction_backend') != backend]
+    excluded = {r.get('page_no') for r in other}
+    old_pages = {}
+    for row in original:
+        if row.get('extraction_backend') == backend:
+            old_pages.setdefault(row.get('page_no'), []).append(row)
+    issues = list(records.get('extraction_issues', []))
+    refreshed = {};reparsed = [];retained = []
+    def issue(code,page_no,reason,**extra):
+        value = dict(code=code,page_no=page_no,reason=reason,
+                     source_role='inspection',locations=[dict(page_no=page_no,
+                     source_role='inspection',polygon_page=None)],**extra)
+        if value not in issues:issues.append(value)
+    for page in index.get('pages', []):
+        number = page['page_no']
+        old = old_pages.get(number, [])
+        if number in excluded:
+            if old:
+                refreshed[number] = old
+                retained.append(number)
+                issue('quantity_list_refresh_page_excluded',number,
+                      '该页已有其他检验提取后端记录，未重解析量表；旧量表行保留供核验。')
+            continue
+        try:
+            parsed = extract_quantity_lists(dict(index,pages=[page]))
+        except Exception as exc:
+            parsed = []
+            issue('quantity_list_cache_refresh_failed',number,
+                  '缓存进场数量清单重解析失败，保留旧记录：'+type(exc).__name__,
+                  error_type=type(exc).__name__)
+        ids = [r.get('record_id') for r in parsed]
+        if any(not rid for rid in ids) or len(ids) != len(set(ids)):
+            parsed = []
+            issue('quantity_list_cache_refresh_invalid_rows',number,
+                  '缓存清单重解析产生缺失或重复记录ID，保留旧记录。')
+        if not parsed:
+            if old:
+                refreshed[number] = old
+                retained.append(number)
+                issue('quantity_list_cache_refresh_unreadable',number,
+                      '已有进场数量清单无法从缓存OCR重新定位，保留旧行及原字段供核验。')
+            continue
+        by_id = {r['record_id']:r for r in parsed}
+        missing = [r for r in old if r.get('record_id') not in by_id]
+        for row in missing:
+            if row.get('record_id'):
+                by_id[row['record_id']] = row
+        if missing:
+            retained.append(number)
+            issue('quantity_list_cache_refresh_incomplete',number,
+                  '缓存清单只重读到部分旧行；未重读行仍保留，请核验原图。',
+                  record_ids=[r.get('record_id') for r in missing])
+        refreshed[number] = list(by_id.values())
+        reparsed.append(number)
+    # Cached records can refer to a page absent from a damaged OCR index.
+    for number,old in old_pages.items():
+        if number not in refreshed and not any(p['page_no']==number for p in index.get('pages',[])):
+            refreshed[number]=old;retained.append(number)
+            issue('quantity_list_cache_page_missing',number,'缓存OCR缺少旧量表页面，保留旧记录供核验。')
+    updated=[];seen=set()
+    for row in other+[r for rows in refreshed.values() for r in rows]:
+        rid=row.get('record_id')
+        if rid and rid in seen and row.get('extraction_backend') == backend:
+            issue('quantity_list_cache_duplicate_record_id',row.get('page_no'),
+                  '缓存记录存在重复记录ID，保留首条并标记重复供核验。',record_id=rid)
+            continue
+        if rid:seen.add(rid)
+        updated.append(row)
+    records['records']=sorted(updated,key=lambda r:(r.get('page_no',0),r.get('row_no',0),str(r.get('record_id',''))))
+    records['extraction_issues']=issues
+    records['quantity_list_cache_refresh']=dict(backend=backend,reparsed_pages=sorted(set(reparsed)),
+        retained_pages=sorted(set(retained)),source_records_unchanged=True,
+        cached_ocr_only=True,record_count=len(updated))
+    from .entry_duplicates import deduplicate_certificate_records
+    records, _, _ = deduplicate_certificate_records(records)
+    records['quantity_list_cache_refresh']['record_count'] = len(records['records'])
+    return records
+
+
 def generate_review(pdf, index_path, records_path, output, *, rules=None, matching_options=None):
     """Steel-specific keys; reusable rendering and explicit input paths."""
     from types import SimpleNamespace
@@ -173,6 +315,7 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
     index = json.loads(args.index.read_text())
     records = json.loads(args.records.read_text())
     assert hashlib.sha256(args.pdf.read_bytes()).hexdigest() == index['pdf_sha256'] == records['pdf_sha256']
+    records = refresh_cached_quantity_lists(index, records)
     from material_ocr.ocr.attachments import build_regions, classify_page_text
     from material_ocr.ocr.layout import split_entities
     for page in index['pages']:
@@ -187,6 +330,7 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
             page['document_type'] = corrected
     catalog = build_keyword_catalog(index, rules)
     recall_plate_fields(index, catalog)
+    recall_joined_certificate_heats(index, catalog)
     classification = classify(index, catalog['items'])
     for record in records['records']:
         if record.get('extraction_backend') == 'quantity_list_spatial_v1':
@@ -226,7 +370,7 @@ def generate_review(pdf, index_path, records_path, output, *, rules=None, matchi
                   metrics=dict(certificate_identifiers=certs))),
                   classification=save('recognition_results.json', classification),
                   catalog=save('keyword_catalog.json', dict(keyword_catalog=catalog)),
-                  records=args.records, index=args.index)
+                  records=save('records_for_matching.json', records), index=args.index)
     from material_ocr.materials.rebar.filling import build_filling_profile
     # Older merged records reference their original cell OCR instead of
     # carrying coordinates. Read only results inside this inspection folder.

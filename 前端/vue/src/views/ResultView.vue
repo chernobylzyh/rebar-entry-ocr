@@ -21,11 +21,11 @@
             <template v-if="!currentPdf.hasSourcePdf"> · 旧卷（无源 PDF）</template>
           </div>
           <div v-if="currentPdf" class="pdf-actions">
-            <button :disabled="!currentPdf.hasSourcePdf || processing.resplit" @click="resplitPdf"
+            <button :disabled="!currentPdf.hasSourcePdf || processing.resplit || recognitionStore.isRunning(selectedPdfName)" @click="resplitPdf"
                     :title="currentPdf.hasSourcePdf ? '用 source.pdf 按新 DPI 重新渲染图片（会清掉 OCR 缓存和台账）' : '该卷没有原始 PDF（旧卷），请重新上传后再重切'">
               {{ processing.resplit ? '⏳ 切分中...' : '✂ 重新切分' }}
             </button>
-            <button class="danger" :disabled="processing.delete" @click="deletePdf">
+            <button class="danger" :disabled="processing.delete || recognitionStore.isRunning(selectedPdfName)" @click="deletePdf">
               {{ processing.delete ? '⏳ 删除中...' : '🗑 删除' }}
             </button>
           </div>
@@ -58,20 +58,31 @@
           </span>
           <span class="spacer"></span>
           <button v-if="false" :disabled="processing.currentPage" @click="rerunPageOcr" title="只重跑当前页 OCR">↻ 单页 OCR</button>
-          <button :disabled="!currentPdf.ledgerRecognized" @click="clearCache('ledger')" title="删除台账（保留 OCR 缓存）">🗑 清台账</button>
-          <button @click="clearCache('all')" title="删除台账 + 所有 pageNNN.ocr.json">🗑 清全部</button>
+          <button :disabled="!currentPdf.ledgerRecognized || recognitionStore.isRunning(selectedPdfName)" @click="clearCache('ledger')" title="删除台账（保留 OCR 缓存）">🗑 清台账</button>
+          <button :disabled="recognitionStore.isRunning(selectedPdfName)" @click="clearCache('all')" title="清除台账和 OCR 缓存">🗑 清全部</button>
           <button :class="{ active: configDrawerOpen }" @click="configDrawerOpen = !configDrawerOpen">⚙ 配置</button>
-          <button class="primary" :disabled="recognitionStore.isRunning(selectedPdfName)" @click="recognizePdf">
+          <button class="primary" :disabled="!ocrModels.length || recognitionStore.isRunning(selectedPdfName)" @click="recognizePdf">
             {{ recognitionStore.isRunning(selectedPdfName) ? ('⏳ ' + (recognizeProgress || '识别中...')) : '▶ 识别整卷 PDF' }}
           </button>
+        </div>
+
+        <div v-if="currentRecognition && recognitionStore.isRunning(selectedPdfName)" class="recognition-progress" role="status" aria-live="polite">
+          <span>{{ recognizeProgress }}</span>
+          <progress v-if="['classify', 'extract', 'attachments', 'inspection'].includes(currentRecognition.stage) && currentRecognition.total > 0 && !currentRecognition.connectionError"
+                    :max="currentRecognition.total || 1" :value="currentRecognition.current || 0"></progress>
+          <progress v-else></progress>
+          <small>{{ currentRecognition.message }}；{{ currentRecognition.stage === 'inspection' ? '统计所有进场表实际完成的单元格数' : '页面阶段分别统计实际完成页数' }}</small>
+        </div>
+        <div v-else-if="currentRecognition && ['failed', 'interrupted'].includes(currentRecognition.status)" class="recognition-error" role="alert">
+          {{ currentRecognition.message || currentRecognition.error }}。可重新启动识别。
         </div>
 
         <div v-show="configDrawerOpen && currentPdf" class="config-drawer" :class="{ open: configDrawerOpen }">
           <div class="config-inner">
             <div class="field">
               <label>识别方式</label>
-              <select v-model="config.model">
-                <option value="local-paddle">本地 PaddleOCR + 自动匹配规则</option>
+              <select v-model="config.model" :disabled="!ocrModels.length || recognitionStore.isRunning(selectedPdfName)">
+                <option v-for="model in ocrModels" :key="model.id" :value="model.id">{{ model.label }}</option>
               </select>
             </div>
             <div class="field inline">
@@ -100,8 +111,8 @@
               <template v-else>未选择页</template>
             </span>
             <button class="zoom-btn" :disabled="!selectedPdfName" @click="openViewer" title="放大查看当前页图片">⛶ 放大</button>
-            <button class="rotate-btn" :disabled="!selectedPdfName || processing.rotate" @click="rotatePage"
-                    title="顺时针旋转 90°（无损，会清本页 OCR 和整卷台账）">
+            <button class="rotate-btn" :disabled="!selectedPdfName || processing.rotate || recognitionStore.isRunning(selectedPdfName)" @click="rotatePage"
+                    title="顺时针旋转 90°（保留台账、人工补正和核验结果）">
               {{ processing.rotate ? '⏳ 旋转中...' : '↻ 旋转90°' }}
             </button>
           </div>
@@ -113,7 +124,7 @@
               <span class="green">绿框 {{ matchedCount }} 个 = 台账值（可点击）</span> ·
               <span class="yellow">黄框 = 其他 OCR</span>
             </template>
-            <template v-else>本页无 OCR 缓存，识别整卷后阶段 1 会实时填充坐标框</template>
+            <template v-else>本页暂无 OCR 缓存，整卷识别完成后可查看坐标框</template>
           </div>
           <div class="source-img">
             <div v-if="selectedPdfName" class="image-preview" @dblclick="openViewer" title="双击放大查看">
@@ -166,38 +177,49 @@
               <template v-if="rowsData && rowsData.rows">（{{ rowsData.rows.length }} 条记录）</template>
             </span>
             <span class="spacer"></span>
-            <button class="export-btn" :disabled="!rowsData || rowsData.empty" @click="confirmExportReview">✓ 核验关键字段</button>
-            <button class="export-btn" :disabled="!rowsData || rowsData.empty || !allReviewed" @click="exportLedger('xlsx')">⬇ 导出 Excel</button>
-            <button class="export-btn" :disabled="!rowsData || rowsData.empty || !allReviewed" @click="exportLedger('csv')">⬇ 导出 CSV</button>
+            <button class="export-btn" :disabled="!rowsData || rowsData.empty || recognitionStore.isRunning(selectedPdfName)" @click="confirmExportReview">✓ 核验关键字段</button>
+            <button class="export-btn" :disabled="!rowsData || rowsData.empty || !allReviewed || recognitionStore.isRunning(selectedPdfName)" @click="exportLedger('xlsx')">⬇ 导出 Excel</button>
+            <button class="export-btn" :disabled="!rowsData || rowsData.empty || !allReviewed || recognitionStore.isRunning(selectedPdfName)" @click="exportLedger('csv')">⬇ 导出 CSV</button>
             <button class="export-btn" :disabled="!rowsData || rowsData.empty || comparing" @click="manualExcelInput.click()" title="导入人工识别结果 Excel，与识别台账比对">📤 导入人工 Excel</button>
             <input ref="manualExcelInput" type="file" accept=".xlsx" class="hidden-file-input" @change="onManualExcelChange" />
             <button class="export-btn" @click="loadRows" title="刷新台账">↻ 刷新</button>
           </div>
 
-          <div v-if="rowsData && !rowsData.empty" class="review-note">
-            {{ allReviewed ? '已完成导出前核验' : '自动匹配已完成；请集中核验关键字段。点击单元格定位，双击补正，核验后导出。' }}
+          <div v-if="rowsData && (!rowsData.empty || rowsData.diagnostics?.length)" class="review-note">
+            <template v-if="!rowsData.empty">{{ allReviewed ? '已完成导出前核验' : '自动匹配已完成；请集中核验关键字段。点击单元格定位，双击补正，核验后导出。' }}</template>
             <div v-for="(issue, i) in (rowsData.diagnostics || [])" :key="i">
-              ⚠ {{ issue.reason || issue.code }}
+              ⚠ {{ diagnosticText(issue) }}
               <button v-if="issue.page_no" @click="onJumpToPage(issue.page_no)">p{{ issue.page_no }}</button>
             </div>
           </div>
-          <div v-if="selectedDiagnosticCell" class="review-note">
-            <strong>{{ selectedDiagnosticCell.label }}</strong>
-            <div v-for="(issue, i) in selectedDiagnosticCell.issues" :key="i">
-              ⚠ {{ issue.reason || issue.code }}
-              <button v-for="(loc, j) in (issue.locations || [])" :key="j" @click="jumpToEvidence(loc)">p{{ loc.page_no || '?' }}</button>
-            </div>
-            <div v-for="(candidate, i) in selectedDiagnosticCell.candidates" :key="'candidate-'+i">
-              匹配候选 {{ i+1 }}
-              <span>{{ candidate.reason || '候选来源' }}</span>
-              <button v-for="(loc, j) in (candidate.locations || [])" :key="j" @click="jumpToEvidence(loc)">p{{ loc.page_no }}</button>
-            </div>
+          <div v-if="rowsData && !rowsData.empty" class="review-note field-review-note">
+            <template v-if="selectedDiagnosticCell">
+              <strong>{{ selectedDiagnosticCell.label }}</strong>
+              <div v-for="(issue, i) in selectedDiagnosticCell.issues" :key="i" :data-diagnostic-code="issue.code">
+                ⚠ {{ diagnosticText(issue) }}
+                <button v-for="(loc, j) in (issue.locations || [])" :key="j" @click="jumpToEvidence(loc)">p{{ loc.page_no || '?' }}</button>
+              </div>
+              <small v-if="!selectedDiagnosticCell.issues.length">当前字段匹配正常，无冲突。</small>
+              <details v-if="selectedDiagnosticCell.otherIssues.length" class="other-review-issues">
+                <summary>查看本行其他异常（{{ selectedDiagnosticCell.otherIssues.length }} 项）</summary>
+                <div v-for="(issue, i) in selectedDiagnosticCell.otherIssues" :key="'other-'+i" :data-diagnostic-code="issue.code">
+                  ⚠ {{ issue.field || '关联异常' }}：{{ diagnosticText(issue) }}
+                  <button v-for="(loc, j) in (issue.locations || [])" :key="j" @click="jumpToEvidence(loc)">p{{ loc.page_no || '?' }}</button>
+                </div>
+              </details>
+              <div v-for="(candidate, i) in selectedDiagnosticCell.candidates" :key="'candidate-'+i">
+                匹配候选 {{ i+1 }}
+                <span>{{ candidate.reason || '候选来源' }}</span>
+                <button v-for="(loc, j) in (candidate.locations || [])" :key="j" @click="jumpToEvidence(loc)">p{{ loc.page_no }}</button>
+              </div>
+            </template>
+            <small v-else>单击字段查看异常与来源，双击字段补正。诊断及候选在此区域内滚动查看。</small>
           </div>
           <div class="table-scroll">
             <div v-if="!rowsData || rowsData.empty" class="empty-state">
               <div class="icon">📚</div>
               <div class="title">尚未生成台账</div>
-              <div class="subtitle">点右上"▶ 识别整卷 PDF"开始（已缓存 OCR 时只需推理）</div>
+              <div class="subtitle">点右上"▶ 识别整卷 PDF"开始（已有 OCR 缓存时复用识别结果并重新匹配）</div>
             </div>
             <div v-else-if="!visibleRows.length" class="empty-state">
               <div class="icon">✅</div>
@@ -336,7 +358,9 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useRecognitionStore } from '@/stores/recognition'
+import { useRecognitionStore, recognitionLabel } from '@/stores/recognition'
+import { diagnosticText, fieldReviewDiagnostics, uniqueDiagnostics } from '@/utils/reviewDiagnostics'
+import { readApiResponse } from '@/utils/apiResponse'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 const route = useRoute()
@@ -366,30 +390,27 @@ const hallucOnly = ref(false)       // 仅看异常字段
 const sourceCollapsed = ref(false)  // 源页溯源面板折叠
 const configDrawerOpen = ref(false)
 const processing = ref({ currentPage: false, upload: false, resplit: false, delete: false, rotate: false })
-const recognizeProgress = ref('')
+const currentRecognition = computed(() => recognitionStore.tasks[selectedPdfName.value])
+const recognizeProgress = computed(() => recognitionLabel(currentRecognition.value))
 const imgVersion = ref(0)
 const comparing = ref(false)        // 正在导入人工 Excel 比对
 const compareResult = ref(null)     // 人工 Excel 与识别台账的比对结果
 const manualExcelInput = ref(null)
 
-function setRecognizeProgress(text) {
-  recognizeProgress.value = text
-}
 
-// ---- 推理配置（默认 Prompt 来自后端 presets，见 loadPresets）----
+// ---- 识别配置（保留兼容接口所需的字段说明）----
+const ocrModels = ref([])
 const config = ref({
-  model: 'local-paddle',
+  model: '',
   ocrPrompt: 'Read all the text in the image.',
   reasoningPrompt: `你是一名专业的工程监理资料员，擅长从复杂的工程报审资料中精准提取信息并录入台账。
-你的任务是从提供的整卷 OCR 文字（内容来自报审表、进场检验记录、质保书/配合比报告、送货单，已用「===== 第 N 页 =====」标注页号）中提取关键信息，输出成一条条材料记录的材料监理监督台账。
+你的任务是从整卷 OCR 证据（报审表、进场检验记录或进场数量清单、铭牌、质量证明书、送货单或发货单）中提取关键信息，输出材料监理监督台账。自动匹配阶段不要求人工确认，只在导出前集中核验关键字段。
 
-一、什么是一条记录（最重要）：
-台账的一行 = 一条材料记录 = 数据库的一行，由四个字段唯一确定：
-  规格品种 + 炉批号 + 验收数量 + 质保书编号
-- 这四个值的组合只要有一个不同，就必须拆成不同的记录（各占一个对象），严禁合并成一条。
-- 四者完全相同才是同一条记录。
+一、进场物理行与重复清单归并：
+台账的一行对应进场检验记录或进场数量清单中的一条物理行，规格品种、炉批号、验收数量、质保书编号是该行的关键字段。
+- 同一 PDF 的非空质保书编号重复时，只保留最先出现的物理行，合并后续重复行的来源与冲突证据，数量不累加。空编号不参与证号去重；有实际材料信息的无编号行须保留。原始单元格与业务字段都为空白或横线占位符的模板行不生成台账记录，并保留其来源供追溯。
+- 不按送货单合计、相同规格或相同炉批号合并、拆分、重排进场物理行。
 - 报审表上的公共字段（文件编号、材料名称、使用部位等）在本卷每条记录上都应相同。
-- 典型：同一份报审表里有 C60、C35P10 等不同规格，或同一规格不同炉批号/质保书编号，必须逐条分开。
 
 二、每个字段必须是单个值（标量），严禁数组！
 - 一条记录就是一个 JSON 对象，对象里每个字段都只能有一个值，绝不能是数组/列表。
@@ -398,29 +419,29 @@ const config = ref({
 - 正确示例：{"规格品种": {"value":"HRB400E/10mm","page":7}, ...} 和 {"规格品种": {"value":"HRB400E/12mm","page":9}, ...} 是两个对象。
 
 三、资料结构与字段来源（务必先理解，否则会张冠李戴）：
-- 第1、2页是《工程材料报审表》，是整卷的公共表头。下列字段从报审表读取，对本卷所有材料记录都相同，应原样复制到每一条记录上；不要到后面的质保书/送货单里找，也不要按记录编造出不同的值：
+- 先根据页面标题与内容识别《工程材料报审表》，不固定假设其页码。下列公共字段从报审表读取，并复制到本卷相关材料记录；不要从其他单据拼造：
   · 文件编号（报审表右上角编号）
   · 材料名称（报审表上的材料名称，如"混凝土""钢筋"）
   · 使用部位（报审表"拟用于工程【部位】部位"）
   · 供应商是否报审、供货日期与工程材料报审签认日期同样以报审表为准。
-- 第3页起是随货资料：质保书/配合比报告来自"生产单位"，送货单/发货单来自"供应单位"，进场检验记录登记进场数量。下列字段按每条材料记录分别从这些单据提取，随规格品种/炉批号不同而不同：
+- 生产单位取当前独立铭牌顶部的公司名称；供应单位取当前送货单/发货单顶部的公司名称；验收数量取进场数量清单对应物理行的进场数量。下列字段按每条进场记录分别关联，不能串到相邻铭牌、其他送货单或合计行：
   · 规格品种、验收数量、炉批号、质保书编号、生产单位、供应单位、送货单编号。
-  · 【极易填反，务必区分】炉批号取质保书/质保卡上的「轧制批号」或「炉批号」（抚顺新钢铁等钢厂通常是一串纯数字，如 8 位 46200156）；质保书编号取质保书的「合同编号」或「质检号」（抚顺多为 WK 开头的编号）。带 WK 等字母前缀的是质保书编号，不是炉批号；纯数字的炉批号不要填到质保书编号。
+  · 炉批号取所选独立铭牌的「炉批号」或「轧制批号」，并与对应质量证明书核对；质保书编号优先保留进场清单同一行已提取的值。若唯一证书页读到完全相同且无冲突的编号，字段主定位更新为证书页，同时保留清单编号格证据；清单无值时才取已关联证书编号。编号不完全一致时保留清单值并标红待核验。两者均可含字母或数字，应按实际标签与关联证据区分，不能仅凭字母前缀或是否纯数字判断。
 
 四、字段提取规则：
 1. 供应商是否报审：报审表存在且提交过 → 填"是"；否则省略【报审表】
 2. 文件编号：报审表右上角编号，无则省略【报审表·整卷公共】
 3. 材料名称：报审表中的材料名称（如"混凝土"、"钢筋"）【报审表·整卷公共】
-4. 规格品种：提取材料的规格型号（混凝土如 C60、C35P10；钢筋按"牌号/直径mm"，如 HRB400E/Φ16mm）【质保书/送货单】
-5. 生产单位：从质保书/配合比设计报告的顶部标题栏提取（如"XX 公司"）【生产单位单据】
-6. 供应单位：从送货单/发货单的顶部标题栏提取（如"XX 拌站"）【供应单位单据】
+4. 规格品种：钢筋按当前独立铭牌内的牌号与直径提取，如 HRB400E/Φ16mm，并与进场记录及送货行核对【铭牌】
+5. 生产单位：取当前独立铭牌最上方的公司名称；识别不清晰或有多个公司时保留异常、铭牌页码与位置，供导出前核验【铭牌顶部】
+6. 供应单位：取当前送货单/发货单顶部的公司名称；不能使用收货单位或同页铭牌的生产单位，不确定时保留送货单页码与位置【送货单/发货单顶部】
 7. 供货日期与工程材料报审签认日期：提取报审表上的进场/签认日期，格式：YYYY/MM/DD【报审表】
 8. 使用部位：报审表固定句式为"拟用于工程【部位】部位的【材料名称】，经我方检验合格"。只提取"工程"与"部位"之间的内容（如"B区地上钢结构"），严禁把"部位的"之后的材料名称并入使用部位；该部分应填入"材料名称"字段【报审表·整卷公共】
-9. 送货单编号：提取送货单/发货单右上角的单据编号，无则省略【供应单位单据】
-10. 炉批号：取质保书/电子质保卡上「轧制批号」或「炉批号」标签对应的值（不是合同编号/质检号！）。钢厂（如抚顺新钢铁）的炉批号通常是一串纯数字（如 8 位 46200156）；带 WK 等字母前缀的编号是质保书编号，不要填到这里。配合比报告则取其报告编号。与送货单编号是两个独立字段，严禁合并或用 / 拼接【质保书/质保卡】
-11. 验收数量：按进场检验记录或送货单的总量填写，带单位（如 99m3、38.925t）。进场检验记录是核对清单：其「合格证号」列必须能与对应质保书的「合同编号」对上，用这一对齐关系确定每一行的规格品种/炉批号/数量归属；若相邻行的数量与规格明显错位（表格物理串行，常见于同规格相邻行互换），以「合格证号能对上质保书合同编号」的那行为准，不要机械照抄错位行【进场检验记录/送货单】
-12. 质保书编号：取质保书的「合同编号」或「质检号」（抚顺新钢铁等多为 WK 开头的编号，如 WK……）；它应与进场检验记录「合格证号」列的值一致，可互相印证。不要把纯数字的炉批号填到这里。配合比报告取其报告编号【生产单位单据】
-13. 【提取规则，不是字段】跨单据对齐：一套材料通常由「质保书 + 电子质保卡 + 送货单 + 进场检验记录一行」组成。先用质保书的合同编号去进场检验记录「合格证号」列定位到对应行，再把该行的规格品种、验收数量、炉批号与质保书/质保卡/送货单上的值归集到同一条记录；合同编号对不上的不要强行并到一起。
+9. 送货单编号：取当前送货单/发货单右上角 No. 后的字母和数字，保留前导零；不确定时保留原因与送货单页码、位置【送货单/发货单右上角】
+10. 炉批号：取所选独立铭牌「炉批号」或「轧制批号」标签对应的值，并与对应质量证明书核对；冲突时保留双方证据与位置。不得从邻近铭牌串取，也不得把合同编号、质保书编号或送货单编号并入炉批号【所选独立铭牌】
+11. 验收数量：直接采用进场数量清单对应物理行的进场数量；吨数单位必须有单元格或表头证据。不得改用送货单重量或合计，不拆分、不重排相邻行；与送货行不一致时保留冲突及两侧来源位置【进场数量清单】
+12. 质保书编号：优先填入进场数量清单或进场检验记录同一行「质保证明书编号」「合格证号」等编号列的实际值；再与对应质量证明书编号核对。若唯一证书页读到完全相同且无冲突的编号，仍保留清单值但字段页码定位到证书，并同时保留清单格证据；不完全一致、未找到证书或不唯一时仍保留清单值，标红并定位清单格，诊断列出双方页码和位置，等待最终人工核验。后续炉批号或铭牌关联失败不清空已精确确认的证书编号。清单该格无值时才使用关联证书明确标签下的编号。不得把炉批号当作质保书编号，也不按字母前缀或纯数字猜测编号类型【进场清单值优先，证书页定位需唯一精确核对】
+13. 【提取规则，不是字段】跨单据对齐采用两套自动流程：进场清单有有效质保证明书编号时，先按编号找质量证明书，再用证书炉批号筛选独立铭牌，最后关联送货单；编号无值时，先按规格与牌号找铭牌和送货单，再用铭牌炉批号找质量证明书。清单已知牌号和规格须同时核对，明确冲突不自动确认为一致。包含多个炉批号且未分离物理卡片的报告文字不能阻塞完整单炉号铭牌；同一物理铭牌不同 OCR 视图应合并证据，不能当成多个独立候选。铭牌与唯一送货单同页时直接关联表头，可填写供应单位和送货单编号；同页多张铭牌可共享送货表头，货物行缺字应单独提示核验。跨页送货匹配要求规格严格相同，牌号按从右向左提取的有效强度数字（如400、500）一致，可容忍HRB前缀误读多出的数字。炉批号仅一个英文字母差异的候选可写入铭牌读数，但必须标明与证书矛盾、双方页码及位置。未匹配、存在多个真实卡片、识别不清晰或信息冲突时写明具体失败环节与来源，供导出前集中人工核验。
 
 五、输出格式（务必严格遵守，否则渲染失败）：
 输出一个 JSON 对象，形如 {"records": [ {记录1}, {记录2}, ... ]}。
@@ -428,12 +449,12 @@ const config = ref({
 - **每个字段的值必须是一个对象 {"value": "字段值", "page": N}**：
   · value 是该字段的单个字符串值（严禁数组）；
   · page 是**这个值实际出现在第几页**，必须取自 OCR 文本里 "===== 第 N 页 =====" 分隔线中的 N（全卷绝对页号）。
-- **每个字段标它自己的来源页**：同一条记录的不同字段往往来自不同页。例如规格品种/验收数量在送货单页就标送货单页号，炉批号/质保书编号/生产单位在质保书页就标质保书页号，报审表公共字段标第 1 或第 2 页。**不要图省事把整条记录的字段都标成同一个页号**。
+- **每个字段标它自己的来源页**：生产单位与规格品种定位到当前铭牌，供应单位与送货单编号定位到当前送货单，验收数量定位到进场数量清单，质保书编号在唯一精确证书确认时定位到证书页并保留清单编号格证据；编号冲突、未匹配或不唯一时定位到清单编号格并保留证书候选页。清单无值而采用证书编号时定位到证书。报审表公共字段定位到实际报审表页。不要把整条记录的字段都标成同一个页号。
 - 严禁用"第几张图片""第几个附件"这类相对序号作为 page。
-- 每条记录必须包含那四个主键字段（规格品种、炉批号、验收数量、质保书编号）；找不到就填 {"value":"","page":该字段应在的页号}，但键要保留。
+- 每条记录必须包含这四个关键字段（规格品种、炉批号、验收数量、质保书编号）；找不到就保留空值与已定位的来源页、原因和位置，但键要保留。
 - 报审表公共字段（文件编号、材料名称、使用部位等）在报审表存在时应出现在每条记录上，page 标报审表所在页。
 - 其余字段找不到就省略该键，不要填 null、"无"、"N/A"、"暂无" 等占位符，也不要输出数组。
-- 去除 OCR 识别产生的乱码，确保数字和字母准确。OCR 可能把 0/8、1/7、5/6 等数字认错或截断；当相邻两页属于同一套单据时（如电子质保卡 + 质保书、送货单 + 进场记录），可用两页文字互相校正数字，但 OCR 原文里完全不存在的编号严禁臆造。
+- 保留原始 OCR 与来源证据。数字、字母识别模糊、截断或相互冲突时记录异常与原图位置；不得补造编号或用相邻单据覆盖当前物理行。
 - 只允许出现上述 1-12 列出的字段（下面第 13 条是提取规则，不是字段，禁止把它作为字段输出），不要凭空造出"准用证、产品标志、外观质量、抗压强度、氯离子含量、碱含量"等未定义字段。
 - 记录对象顶层可带一个整数 page（取规格品种/验收数量所在的主要页）作为兜底；但只要某字段实际来自别的页，就必须在该字段对象里写它自己的 page，不能依赖顶层兜底。
 - 没有任何材料记录时输出 {"records": []}。
@@ -642,7 +663,7 @@ const selectedDiagnosticCell = ref(null)
 const focusedEvidence = ref('')
 const allReviewed = computed(() => !!rowsData.value?.rows?.length && rowsData.value.rows.every(r => r.review_confirmed))
 function cellReason(cell) {
-  return (cell?.diagnostics || []).map(i => i.reason || i.code).join('；') || (cell?.page ? '来源页 p' + cell.page : '来源位置未定位')
+  return uniqueDiagnostics(cell?.diagnostics || []).map(diagnosticText).join('；') || (cell?.page ? '来源页 p' + cell.page : '来源位置未定位')
 }
 async function jumpToEvidence(loc) {
   if (!loc?.page_no) return
@@ -669,8 +690,7 @@ async function editLedgerCell(row, col) {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ record_index: row.record_index, field: col, value })
     })
-    const body = await response.json()
-    if (!response.ok || body.code !== 200) throw new Error(body.msg || '补正失败')
+    await readApiResponse(response, '补正失败')
     await loadRows()
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -682,14 +702,12 @@ async function confirmExportReview() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ revision: rowsData.value.revision, note: '用户在导出前集中核验关键字段和匹配异常' })
     })
-    const body = await response.json()
-    if (!response.ok || body.code !== 200) throw new Error(body.msg || '核验失败')
+    await readApiResponse(response, '核验失败')
     await loadRows(); ElMessage.success('核验已保存，可以导出')
   } catch (e) { ElMessage.error(e.message) }
 }
 function onCellClick(row, col) {
-  const current = row.cells[col]
-  selectedDiagnosticCell.value = { label: col, issues: [...(current?.diagnostics || []), ...(row.diagnostics || [])], candidates: row.match_candidates || [] }
+  selectedDiagnosticCell.value = { label: col, ...fieldReviewDiagnostics(row, col), candidates: row.match_candidates || [] }
   const cell = (row && row.cells && row.cells[col]) || null
   if (!cell || !cell.page) return
   onJumpToPage(cell.page, cellKey(row, col))
@@ -860,6 +878,7 @@ async function selectCurrentPdf(name) {
   if (seq !== _loadSeq) return
   compareResult.value = null
   await loadRows()
+  void recognitionStore.track(name)
 }
 
 async function onSelectPage(p) {
@@ -945,153 +964,52 @@ async function rerunPageOcr() {
   }
 }
 
-// 识别请求未确认时的兜底：轮询 /api/library，直到该卷 ledgerRecognized=true 再刷新视图（最多约 30 分钟）。
-async function ensureLedgerRefreshed(name, dispName) {
-  const check = async () => {
-    try {
-      const r = await fetch('/api/library')
-      if (!r.ok) return false
-      const data = await r.json()
-      const lib = (data && data.data) || data
-      const p = (lib.pdfs || []).find(x => x.name === name)
-      return !!(p && p.ledgerRecognized)
-    } catch (e) {
-      return false
-    }
-  }
-  const applyResult = async () => {
-    await loadLibrary()
-    if (selectedPdfName.value === name) await selectCurrentPdf(name)
-    ElMessage.success('台账已生成：' + dispName)
-  }
-  // 先立即查一次：可能请求虽失败但后台已写完
-  if (await check()) {
-    await applyResult()
+// A single volume job replaces the old concurrent page POSTs. Progress comes
+// from actual pipeline callbacks and survives route changes/browser refreshes.
+async function recognizePdf() {
+  if (!ocrModels.value.some(model => model.id === config.value.model)) {
+    ElMessage.error('模型选项尚未加载，请刷新后重试')
     return
   }
-  await new Promise((resolve) => {
-    let attempts = 0
-    const timer = setInterval(async () => {
-      attempts++
-      let ok = false
-      try { ok = await check() } catch (e) { /* ignore */ }
-      if (ok) {
-        clearInterval(timer)
-        await applyResult()
-        resolve()
-      } else if (attempts >= 360) {
-        clearInterval(timer)
-        resolve()
-      }
-    }, 5000)
-  })
-}
-
-async function recognizePdf() {
   const name = selectedPdfName.value
   if (!name || recognitionStore.isRunning(name)) return
-  if (!config.value.reasoningPrompt) {
-    ElMessage.warning('请先填写推理 Prompt（点 配置 按钮打开抽屉）')
-    configDrawerOpen.value = true
-    return
-  }
-  const startPdf = currentPdf.value && currentPdf.value.name === name ? currentPdf.value : null
-  const dispName = (startPdf && (startPdf.originalName || startPdf.name)) || name
-  recognitionStore.start(name)
-  setRecognizeProgress('')
+  const form = new URLSearchParams()
+  if (config.value.reasoningPrompt) form.append('prompt', config.value.reasoningPrompt)
+  if (config.value.ocrPrompt) form.append('ocr_prompt', config.value.ocrPrompt)
+  form.append('model', config.value.model)
+  if (config.value.forceOcrRefresh) form.append('force_ocr_refresh', 'true')
   try {
-    // ---- 阶段 1：逐页 OCR，先出黄框 ----
-    const forceOcr = config.value.forceOcrRefresh
-    const ocrPrompt = config.value.ocrPrompt
-    const pages = (startPdf && startPdf.pages) || []
-    const todo = pages.filter(pg => forceOcr || !pg.ocrCached)
-    const CONCURRENCY = 4
-    let done = 0
-    let failed = 0
-    const progressText = () => {
-      let t = '阶段1 逐页OCR ' + Math.min(done, todo.length) + '/' + todo.length
-      if (failed > 0) t += '（失败 ' + failed + '）'
-      return t
-    }
-    if (todo.length) {
-      setRecognizeProgress(progressText())
-      for (let i = 0; i < todo.length; i += CONCURRENCY) {
-        const chunk = todo.slice(i, i + CONCURRENCY)
-        await Promise.allSettled(chunk.map(async (pg) => {
-          try {
-            const fd = new URLSearchParams()
-            if (ocrPrompt) fd.append('prompt', ocrPrompt)
-            const r = await fetch('/api/library/' + encodeURIComponent(name) +
-              '/pages/' + pg.page + '/ocr', {
-              method: 'POST',
-              body: fd,
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-            })
-            const j = await r.json().catch(() => ({}))
-            if (!r.ok || (j && j.code && j.code !== 200)) {
-              throw new Error((j && j.msg) || ('HTTP ' + r.status))
-            }
-            const d = (j && j.data) || j
-            if (d && d.error) throw new Error(d.error)
-          } catch (e) { /* 单页失败不阻断；阶段2远端会补跑缺失页 */ failed++ }
-          // 正在查看的页识别完成后立即刷新黄框（不等整批结束）
-          if (selectedPdfName.value === name && pg.page === currentPage.value) {
-            await loadPageOcr()
-            imageLoaded.value = true
-          }
-        }))
-        done += chunk.length
-        setRecognizeProgress(progressText())
-        // 当前页有新 OCR 时立即刷新黄框
-        if (selectedPdfName.value === name) {
-          await loadPageOcr()
-          imageLoaded.value = true
-        }
-      }
+    const task = await recognitionStore.start(name, form)
+    if (task && task.status === 'completed') {
       await loadLibrary()
+      if (selectedPdfName.value === name) await selectCurrentPdf(name)
     }
+  } catch (error) { ElMessage.error('启动识别失败: ' + error.message) }
+}
 
-    // ---- 阶段 2：整卷推理（复用阶段1的 OCR 缓存），生成台账并标绿框 ----
-    setRecognizeProgress('阶段2 整卷推理中...')
-    const fd2 = new URLSearchParams()
-    fd2.append('prompt', config.value.reasoningPrompt)
-    if (ocrPrompt) fd2.append('ocr_prompt', ocrPrompt)
-    if (config.value.model) fd2.append('model', config.value.model)
-    const r2 = await fetch('/api/library/' + encodeURIComponent(name) +
-      '/recognize', {
-      method: 'POST',
-      body: fd2,
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    })
-    const j2 = await r2.json().catch(() => ({}))
-    if (!r2.ok || (j2 && j2.code && j2.code !== 200)) {
-      throw new Error((j2 && j2.msg) || ('HTTP ' + r2.status))
-    }
+watch(() => [selectedPdfName.value, currentRecognition.value?.task_id, currentRecognition.value?.status], async (state, prior) => {
+  const [name, taskId, status] = state
+  if (!name || (prior && state.every((value, i) => value === prior[i]))) return
+  if (status === 'completed') {
     await loadLibrary()
     if (selectedPdfName.value === name) {
-      await selectCurrentPdf(name)
+      await loadRows()
+      await loadPageOcr()
+      imageLoaded.value = true
     }
-    ElMessage.success('台账已生成：' + dispName)
-  } catch (e) {
-    const errMsg = String((e && e.message) || e || '')
-    const mayStillRun = /fetch|timeout|timed out|NetworkError|ECONNABORTED|SocketTimeout/i.test(errMsg)
-    if (mayStillRun) {
-      ElMessage.error('识别请求未确认（' + errMsg + '），后台可能仍在识别，正在自动检查结果...')
-      await ensureLedgerRefreshed(name, dispName)
-    } else {
-      ElMessage.error('识别失败: ' + errMsg)
+    if (prior && prior[0] === name && ['queued', 'running', 'submitting'].includes(prior[2])) {
+      ElMessage.success('OCR与自动匹配已完成，请核验关键字段')
     }
-  } finally {
-    recognitionStore.finish(name)
-    setRecognizeProgress('')
+  } else if (['failed', 'interrupted'].includes(status) && prior && prior[0] === name && ['queued', 'running', 'submitting'].includes(prior[2])) {
+    ElMessage.error(currentRecognition.value?.message || currentRecognition.value?.error || '识别未完成，可重新启动')
   }
-}
+})
 
 async function clearCache(scope) {
   if (!selectedPdfName.value) return
   const msg = scope === 'all'
-    ? '清除全部缓存？下次 recognize 全部要重跑 OCR（约 4 分钟）。图片本身不会被删除。'
-    : '清除台账？下次 recognize 只重推理（约 40 秒）。'
+    ? '清除全部缓存？下次整卷识别将重新运行 OCR，处理进度按实际阶段和页数显示。'
+    : '清除台账？下次整卷识别将复用已有 OCR 缓存，重新提取字段并自动匹配。'
   if (!confirm(msg)) return
   try {
     const r = await fetch('/api/library/' + encodeURIComponent(selectedPdfName.value) +
@@ -1306,17 +1224,34 @@ async function rotatePage() {
     if (!r.ok || (data && data.code && data.code !== 200)) {
       throw new Error((data && data.msg) || ('HTTP ' + r.status))
     }
-    imgVersion.value++
-    pageOcr.value = null
-    rowsData.value = null
-    await loadLibrary()
-    await selectCurrentPdf(name)
-    await onSelectPage(page)
-    ElMessage.success('已旋转 90°（该页 OCR 与台账已清，需重新识别）')
+    // Rotation changes the source image and its boxes, not the ledger. Keep the
+    // selected record and loaded rows visible while refreshing this page only.
+    if (selectedPdfName.value === name && currentPage.value === page) {
+      imgVersion.value++
+      pageOcr.value = null
+      focusedEvidence.value = ''
+      await loadPageOcr()
+    }
+    ElMessage.success('已旋转 90°，台账及人工核验结果已保留')
   } catch (e) {
     ElMessage.error('旋转失败: ' + e.message)
   } finally {
     processing.value.rotate = false
+  }
+}
+
+async function loadOcrModels() {
+  try {
+    const response = await fetch('/api/library/ocr-models')
+    const body = await response.json()
+    const catalog = body.data || body
+    if (!response.ok || !Array.isArray(catalog.models) || !catalog.models.some(model => model.id === catalog.default_model)) {
+      throw new Error('模型目录不可用')
+    }
+    ocrModels.value = catalog.models
+    config.value.model = catalog.default_model
+  } catch (error) {
+    ElMessage.error('加载 OCR 模型失败：' + error.message)
   }
 }
 
@@ -1345,6 +1280,7 @@ watch(() => route.fullPath, async () => {
 })
 
 onMounted(async () => {
+  await loadOcrModels()
   await loadPresets()
   await loadLibrary()
   const routeName = decodeURIComponent(route.params.pdfName || '')
@@ -1359,6 +1295,14 @@ onMounted(async () => {
 })
 </script>
 <style scoped>
+.recognition-progress, .recognition-error { padding: 10px 16px; background: #eff6ff; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.recognition-progress progress { flex: 1; min-width: 120px; }
+.recognition-progress small { width: 100%; color: #475569; }
+.other-review-issues { margin: 8px 0; }
+.other-review-issues summary { cursor: pointer; color: #475569; }
+.other-review-issues > div { margin-top: 4px; }
+.recognition-error { color: #b91c1c; background: #fef2f2; }
+
 /* === 浅色数据表盘风 — 单卷台账（左侧栏 + 源页溯源 + 台账横表） === */
 .library-layout {
   height: calc(100vh - 48px);
@@ -1999,5 +1943,6 @@ td.cell-flash { animation: cellFlash 10s ease-out; }
 
 <style scoped>
 .review-note { padding: 10px 14px; border: 1px solid var(--border); background: var(--bg-surface); line-height: 1.8; }
+.field-review-note { height: 144px; flex: 0 0 144px; box-sizing: border-box; overflow: auto; }
 .review-note button { margin: 2px 5px; cursor: pointer; }
 </style>

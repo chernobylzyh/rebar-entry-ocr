@@ -14,6 +14,8 @@ python -m pip install -e .
 
 另行安装与运行设备兼容的 Paddle 计算后端。仅使用 CPU 时可执行 `python -m pip install paddlepaddle`；GPU 后端按设备与 CUDA 兼容条件准备。模型权重与缓存不随仓库分发，接收方需准备所需模型，或确保首次启动和识别时能够下载。缓存路径通过 `--model-cache` 指定。
 
+默认模型为 `local-glm`。启动前按 [GLM 环境准备](GLM_OCR.md#模型与环境) 安装独立推理依赖并准备本地权重；项目安装不会自动提供它们。选择 `local-paddle` 时也需准备对应本地权重。
+
 ## 启动三个服务
 
 三个终端均从仓库根目录开始，保持服务运行。

@@ -17,11 +17,15 @@ from material_ocr.workflow import code_fingerprint, utc_now, write_json
 
 
 class TaskService:
-    def __init__(self, data_dir, model_cache, device='gpu:0', profile='batched_gpu', registry=None, runner=None):
+    def __init__(self, data_dir, model_cache, device='gpu:0', profile='batched_gpu', registry=None, runner=None,
+                 *, artifact_policy='compact'):
         self.root = Path(data_dir).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.model_cache = Path(model_cache).resolve()
         self.device, self.profile = device, profile
+        if artifact_policy not in ('compact', 'full'):
+            raise ValueError('artifact_policy须为compact或full')
+        self.artifact_policy = artifact_policy
         self.registry = registry or MaterialRegistry()
         self.runner = runner or self.run_document
         self.lock = threading.RLock()
@@ -76,7 +80,8 @@ class TaskService:
             raise ValueError('该材料不支持此检验表版式')
         job = dict(id=job_id, material_id=material_id, material_name=adapter.info.name,
                    layout=layout, created_at=utc_now(), status='queued', message='等待识别', documents=documents,
-                   options=dict(device=self.device, profile=self.profile), filling_available=adapter.form_writer() is not None)
+                   options=dict(device=self.device, profile=self.profile, artifact_policy=self.artifact_policy),
+                   filling_available=adapter.form_writer() is not None)
         with self.lock:
             if self.closing:
                 raise ValueError('服务正在停止')
@@ -198,6 +203,7 @@ class TaskService:
         command = [sys.executable, '-m', 'material_ocr', 'analyze', '--pdf', document['input_path'],
                    '--out', str(output), '--material', job['material_id'], '--layout', job['layout'],
                    '--device', self.device, '--profile', self.profile, '--model-cache', str(self.model_cache),
+                   '--artifact-policy', self.artifact_policy,
                    '--run-id', job['id']+'-'+document['id']]
         execution = dict(run_id=job['id']+'-'+document['id'], status='running', start_time_utc=utc_now(),
                          command=command, working_directory=str(Path.cwd()), code_version=self.code_hash,

@@ -78,13 +78,15 @@ function onPdfDrop(e) {
 }
 
 async function onUpload() {
+  if (loading.value) return
   if (!pdfFile.value) {
     ElMessage.warning('请先选择 PDF')
     return
   }
+  const uploadingFile = pdfFile.value
   const doSend = async (overwrite) => {
     const fd = new FormData()
-    fd.append('file', pdfFile.value)
+    fd.append('file', uploadingFile)
     fd.append('dpi', '200')
     fd.append('image_format', 'PNG')
     if (overwrite) fd.append('overwrite', 'true')
@@ -111,7 +113,7 @@ async function onUpload() {
     const data = (res && res.data) || {}
     lastResult.value = data
     ElMessage.success('上传成功')
-    pdfFile.value = null
+    if (pdfFile.value === uploadingFile) pdfFile.value = null
   } catch (e) {
     // axios interceptor already toasted
   } finally {

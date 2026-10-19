@@ -1,6 +1,6 @@
 # 前端工作台
 
-Vue 3 + Vite 5 + Element Plus 提供界面，Spring Boot 2.7.18 提供业务接口，Python 提供本地 OCR 与自动匹配。完整流程和三服务启动方式见 [仓库 README](../README.md)，规则和接口见 [自动台账说明](../docs/AUTOMATIC_LEDGER.md)。
+Vue 3 + Vite 5 + Element Plus 提供界面，Spring Boot 2.7.18 提供业务接口，Python 提供本地 OCR 与自动匹配。当前工作台最终 OCR 模型为本地 GLM-OCR（`local-glm`），GLM 模型、缓存和三服务启动方式见 [GLM-OCR 使用说明](../docs/GLM_OCR.md)，规则和接口见 [自动台账说明](../docs/AUTOMATIC_LEDGER.md)。
 
 ## 环境与目录
 
@@ -18,7 +18,7 @@ Vue 3 + Vite 5 + Element Plus 提供界面，Spring Boot 2.7.18 提供业务接�
 
 ## 启动
 
-先按仓库 README 启动 Python OCR 服务在 8000。从仓库根目录启动 Java：
+先按 [GLM-OCR 使用说明](../docs/GLM_OCR.md)启动 Python OCR 服务在 8000；默认复用 `.venv-glm/bin/python` 和 `models/GLM-OCR/`，不复制模型。从仓库根目录启动 Java：
 
 ```bash
 OCR_BASE_URL=http://127.0.0.1:8000 bash 前端/bin/start-local.sh
@@ -38,6 +38,8 @@ npm run dev
 若已在 `前端/`，先执行 `cd vue`。依赖安装在 `vue/`，以此处的 `package.json` 和 `package-lock.json` 为准。无需额外 `.env` 文件。
 
 访问终端显示的地址，默认 http://localhost:5173。Vite 将 `/api` 和 `/image` 代理到 Java 的 8080。WSL 或远程开发需从其他设备访问时，可追加 `-- --host 0.0.0.0`，使用对应主机 IP 与实际端口；端口被占用时以终端输出为准。
+
+选择已有 PDF 后直接点击「识别整卷 PDF」即可复测。保持「强制重跑 OCR」未选中，系统复用有效 GLM JSON 缓存，仅识别缺失页；无须为测试重新上传四份文件。匹配、台账字段与人工核验流程保持现有行为。
 
 ## 构建与数据库
 

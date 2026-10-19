@@ -35,8 +35,10 @@ def contained(root, relative):
 
 
 def create_app(data_dir=Path('runs/web'), *, model_cache=Path('models/paddlex_cache'),
-               device='gpu:0', profile='batched_gpu', review_library=None, task_service=None):
-    service = task_service or TaskService(data_dir, model_cache, device, profile)
+               device='gpu:0', profile='batched_gpu', review_library=None, task_service=None,
+               artifact_policy='compact'):
+    service = task_service or TaskService(data_dir, model_cache, device, profile,
+                                        artifact_policy=artifact_policy)
     library = {}
     library_root = Path(review_library).resolve() if review_library else None
 
@@ -98,7 +100,8 @@ def create_app(data_dir=Path('runs/web'), *, model_cache=Path('models/paddlex_ca
     app = FastAPI(title='材料表单OCR', lifespan=lifespan)
     app.state.tasks = service
     from .library import create_library_router
-    app.include_router(create_library_router(data_dir, model_cache, device, profile))
+    app.include_router(create_library_router(data_dir, model_cache, device, profile,
+                                             artifact_policy=artifact_policy))
     app.mount('/static', StaticFiles(directory=STATIC), name='static')
 
     @app.get('/')
@@ -178,6 +181,12 @@ def create_app(data_dir=Path('runs/web'), *, model_cache=Path('models/paddlex_ca
         if job_id not in service.jobs:
             raise HTTPException(404, '任务不存在')
         target = contained(service.root / job_id, relative)
+        if not target.exists() and target.suffix.lower() == '.png' and Path(str(target)+'.artifact.json').is_file():
+            from material_ocr.storage_artifacts import materialize_artifact
+            try:
+                materialize_artifact(target, allowed_root=service.root / job_id)
+            except (OSError, ValueError, KeyError) as exc:
+                raise HTTPException(409, '诊断图片暂时无法恢复，请保留日志检查') from exc
         normalized = target.relative_to(service.root / job_id).parts
         if not target.is_file() or not normalized or normalized[0] not in ('documents', 'logs'):
             raise HTTPException(404, '文件不存在')
@@ -199,6 +208,12 @@ def create_app(data_dir=Path('runs/web'), *, model_cache=Path('models/paddlex_ca
         if review_id not in library:
             raise HTTPException(404, '审核结果不存在')
         target = contained(library[review_id]['directory'], relative)
+        if not target.exists() and target.suffix.lower() == '.png' and Path(str(target)+'.artifact.json').is_file():
+            from material_ocr.storage_artifacts import materialize_artifact
+            try:
+                materialize_artifact(target, allowed_root=library_root)
+            except (OSError, ValueError, KeyError) as exc:
+                raise HTTPException(409, '诊断图片暂时无法恢复，请保留日志检查') from exc
         if not target.is_file():
             raise HTTPException(404, '文件不存在')
         if relative == 'index.html':

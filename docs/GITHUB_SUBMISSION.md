@@ -6,7 +6,7 @@
 
 |路径|作用|
 |---|---|
-|`README.md`、`docs/` 当前说明|环境、流程、匹配规则、接口、交接和核验步骤|
+|`README.md`、`TASK_HANDOFF.md`、`docs/` 当前说明|环境、流程、匹配规则、接口、交接和核验步骤|
 |`pyproject.toml`、`requirements.txt`|Python 安装入口与依赖|
 |`.gitignore`、`前端/.gitignore`|本地数据、模型、依赖和产物排除规则|
 |`src/material_ocr/`|OCR、材料配置、匹配、台账和 Python 接口|
@@ -16,6 +16,8 @@
 |`前端/sql/init.sql`|MySQL 可选部署的初始化表结构|
 |`前端/README.md`|前端环境、开发与构建说明|
 
+`tools/__init__.py` 与 `tools/compare_ocr_ledgers.py` 由 GLM 生产链路直接导入，必须交付。`.gitignore` 仅为这两个文件开放例外，不能把整个工具目录加入。
+
 Python 包内的规则 JSON、模板、HTML、JS 和 CSS 属于运行资源，随源码交付。钢筋业务实现也属于运行代码，不因业务 PDF 留在本地而删减。
 
 ## 保留本地
@@ -23,7 +25,7 @@ Python 包内的规则 JSON、模板、HTML、JS 和 CSS 属于运行资源，�
 - 模型权重、缓存和清单：`models/`、`.paddlex/` 等。
 - PDF、页面图、OCR 原文和索引、自动匹配、审核、台账及导出文件：`runs/`、`data/`、`钢筋报审文件/`、`前端/image/library/`、`前端/image/documents/` 等。
 - 实验方案、运行登记、结果摘要和历史研发资料：`experiments/`、`docs/history/`、`docs/MIGRATION.md`。
-- 开发工具、调试测试和本地环境：根目录 `tools/`、`tests/`、虚拟环境、`node_modules/`、Maven 缓存和本地 JDK。
+- 开发工具、调试测试和本地环境：根目录 `tools/`（生产依赖 `__init__.py` 和 `compare_ocr_ledgers.py` 除外）、`tests/`、虚拟环境、`node_modules/`、Maven 缓存和本地 JDK。
 - 本地 H2 数据库、日志、JAR、Java `target/`、Vue `dist/` 和其他构建产物。
 - 调试解包目录、临时 Excel 和其他处理产物。
 

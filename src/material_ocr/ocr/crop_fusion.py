@@ -228,7 +228,11 @@ def crop_map_from_index(index: dict[str, Any], pages_root: str | Path) -> dict[s
             rid = str(region['region_id']); prefix = f"p{int(page['page_no']):03d}_"
             path = root/f"page_{int(page['page_no']):03d}_upright_{rid.removeprefix(prefix)}.png"
             if not path.is_file():
-                raise FileNotFoundError(f'Missing priority crop: {rid}: {path}')
+                from material_ocr.storage_artifacts import materialize_artifact
+                try:
+                    materialize_artifact(path)
+                except FileNotFoundError:
+                    raise FileNotFoundError(f'Missing priority crop: {rid}: {path}') from None
             result[rid] = str(path.resolve())
     if not result:
         raise ValueError('No priority crops in index')

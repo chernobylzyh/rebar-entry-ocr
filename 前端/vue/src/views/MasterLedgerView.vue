@@ -26,7 +26,7 @@
     <div class="master-hint">
       提示：双击单元格值可直接编辑（回车保存 / Esc 取消）；
       点击<span class="p-link">pN</span>跳转到源页；
-      红框<span class="bad-tag">⚠</span>为一致性校验未命中（待核验）。
+      红框<span class="bad-tag">⚠</span>表示存在字段冲突或尚未确认匹配；空值标记为未识别。
     </div>
 
     <div v-if="loading && !data" class="loading-block">
@@ -60,14 +60,16 @@
                 </span>
               </template>
             </td>
-            <td v-for="col in data.columns" :key="col" :class="{ 'empty-cell': isEmptyCell(row.cells[col]) }">
+            <td v-for="col in data.columns" :key="col"
+                :class="{ 'empty-cell': isEmptyCell(row.cells[col]) }"
+                @dblclick.stop="startEdit(row.pdf_name, row.record_index, col, row.cells[col]?.value || '')">
               <div v-if="isEmptyCell(row.cells[col])" class="empty-marker">—</div>
               <div v-else class="chip-list">
                 <div class="mc-chip" :class="{ bad: row.cells[col].found_in_ocr === false }">
                   <span
                     class="mc-val"
-                    :title="row.cells[col].found_in_ocr === false ? '⚠ 待核验，该值未在源页 OCR 中找到' : (row.cells[col].page ? '来源页 p' + row.cells[col].page : '无来源页')"
-                    @dblclick="startEdit(row.pdf_name, row.record_index, col, row.cells[col].value)"
+                    :title="row.cells[col].found_in_ocr === false ? '⚠ 存在冲突或尚未确认匹配，点击查看来源' : (row.cells[col].page ? '来源页 p' + row.cells[col].page : '无来源页')"
+                    @dblclick.stop="startEdit(row.pdf_name, row.record_index, col, row.cells[col].value)"
                   >{{ row.cells[col].value || '（空）' }}</span>
                   <span
                     v-if="row.cells[col].page"
@@ -154,7 +156,7 @@ function isFirstOfPdf(rowIdx) {
 }
 
 async function clearAllLedgers() {
-  if (!confirm('确定清空【所有 PDF】的台账吗？\n\n将删除每一卷的 ledger.json（OCR 缓存保留，下次识别每卷约 40 秒）。\n\n此操作不可撤销。')) return
+  if (!confirm('确定清空【所有 PDF】的台账吗？\n\n将删除各卷台账并保留 OCR 缓存，下次识别会重新提取字段并自动匹配。\n\n此操作不可撤销。')) return
   clearing.value = true
   try {
     const res = await clearAllLedgersApi()

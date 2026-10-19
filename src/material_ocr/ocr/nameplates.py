@@ -1,6 +1,7 @@
 """Detect independent pasted cards using image contours AND local label evidence."""
 import re
 from .layout import box
+from material_ocr.storage_artifacts import register_derivative
 
 
 def card_bounds(image, blocks):
@@ -94,6 +95,8 @@ def physical_regions(engine,image,blocks,page_no,image_dir,original_shape,rotati
         entity=f'card-{x0}-{y0}-{x1}-{y1}'
         path=image_dir/f'p{page_no:03d}_{entity}.png'
         crop=image[y0:y1,x0:x1];cv2.imwrite(str(path),crop)
+        register_derivative(path,image_dir/f'page_{page_no:03d}_upright.png',
+                            [{'crop':[x0,y0,x1,y1]}],kind='physical_nameplate_crop')
         local=_ocr_blocks(engine,crop,path)
         for b in local:
             b['polygon_page']=[[p[0]+x0,p[1]+y0] for p in b.get('polygon_page') or []]

@@ -40,6 +40,11 @@ public class LibraryController {
         return ApiResponse.ok(libraryService.list());
     }
 
+    @GetMapping("/ocr-models")
+    public Map<String, Object> ocrModels() {
+        return ApiResponse.ok(libraryService.ocrModels());
+    }
+
     @PostMapping("/import-remote")
     public Map<String, Object> importRemote(javax.servlet.http.HttpServletRequest request,
                                             @org.springframework.web.bind.annotation.RequestParam(value = "names", required = false) java.util.List<String> namesParam,
@@ -143,6 +148,20 @@ public class LibraryController {
     public Map<String, Object> reviewLedger(@PathVariable String pdfName, @RequestBody Map<String, Object> body) {
         return ApiResponse.ok(libraryService.confirmExportReview(pdfName,
                 (String) body.get("revision"), (String) body.get("note")));
+    }
+
+    @PostMapping(value = "/{pdfName}/recognition", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
+    public Map<String, Object> startRecognition(@PathVariable String pdfName,
+                                                @RequestParam(value = "prompt", required = false) String prompt,
+                                                @RequestParam(value = "ocr_prompt", required = false) String ocrPrompt,
+                                                @RequestParam(value = "model", required = false) String model,
+                                                @RequestParam(value = "force_ocr_refresh", required = false) Boolean force) {
+        return ApiResponse.ok(libraryService.startRecognition(pdfName, prompt, ocrPrompt, model, Boolean.TRUE.equals(force)));
+    }
+
+    @GetMapping("/{pdfName}/recognition")
+    public Map<String, Object> recognition(@PathVariable String pdfName) {
+        return ApiResponse.ok(libraryService.getRecognition(pdfName));
     }
 
     @GetMapping("/{pdfName}/ledger")

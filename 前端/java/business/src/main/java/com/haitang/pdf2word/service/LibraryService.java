@@ -43,23 +43,22 @@ public class LibraryService {
     private static final java.time.format.DateTimeFormatter TS_ID =
             java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
 
-    /** 生成时间戳 ID（yyyyMMdd_HHmmss），与远端库同名，作为每次主动上传的标识。 */
+    /** 时间戳加UUID避免并发上传碰撞；本地与远端库保持同一标识。 */
     private String nextTimestampId() {
-        for (int i = 0; i < 10; i++) {
-            String id = LocalDateTime.now().format(TS_ID);
-            if (!libraryExists(id)) return id;
-            try {
-                Thread.sleep(1000L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-        return LocalDateTime.now().format(TS_ID) + "_" + (System.currentTimeMillis() % 10000);
+        return LocalDateTime.now().format(TS_ID) + "_" + UUID.randomUUID().toString().replace("-", "");
     }
 
     private final HttpOcrClient ocrClient;
     private final HistoryRepository historyRepository;
+    private final Map<String, Object> recognitionLocks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private Object recognitionLock(String pdfName) {
+        return recognitionLocks.computeIfAbsent(pdfName, key -> new Object());
+    }
+
+    public JSONObject ocrModels() {
+        return ocrClient.ocrModels();
+    }
 
     @Transactional
         public UploadResult uploadPdf(MultipartFile file, Integer dpi, String imageFormat, Boolean overwrite, String nameOverride) {
@@ -216,7 +215,7 @@ public class LibraryService {
     }
 
     /**
-     * 单页旋转（90 的倍数，无损转置）。旋转后该页 OCR 坐标失效，清本页 OCR 与整卷台账。
+     * 单页旋转（90 的倍数，无损转置）。只刷新显示坐标，保留台账及导出前核验结果。
      */
     public Map<String, Object> rotatePage(String pdfName, int page, Integer angle) {
         int a = (angle == null) ? 90 : angle;
@@ -253,16 +252,23 @@ public class LibraryService {
         }
         boolean clearedOcr = Files.exists(PathUtils.pageOcrJson(pdfName, page));
         deleteFile(PathUtils.pageOcrJson(pdfName, page));
-        boolean clearedLedger = Files.exists(PathUtils.ledgerJson(pdfName));
-        deleteFile(PathUtils.ledgerJson(pdfName));
+        boolean refreshedOcr = false;
+        try {
+            // The OCR service retains original-page evidence and maps it to the
+            // current display rotation. Replace only this page's coordinate cache.
+            JSONObject ocr = ocrClient.getLibraryOcr(pdfName, page);
+            if (ocr != null && ocr.containsKey("items") && StringUtils.isBlank(ocr.getString("error"))) {
+                Files.createDirectories(PathUtils.ocrDir(pdfName));
+                writeFile(PathUtils.pageOcrJson(pdfName, page), JSON.toJSONString(ocr));
+                refreshedOcr = true;
+            }
+        } catch (Exception e) {
+            // Rotation already succeeded. Hide stale boxes until the cache can
+            // be fetched again, without deleting verified fields or human edits.
+            log.warn("旋转后同步 OCR 坐标失败: {}#{} -> {}", pdfName, page, e.getMessage());
+        }
         historyRepository.findByPdfName(pdfName).ifPresent(h -> {
             h.setOcrCachedCount(countOcrCached(pdfName));
-            h.setLedgerRecognized(false);
-            h.setLedgerHallucinationCount(null);
-            h.setLastSummary(null);
-            h.setLastError(null);
-            h.setLastResultJson(null);
-            h.setLastStatus(LibraryStatus.READY.name());
             h.setUpdatedAt(LocalDateTime.now());
             historyRepository.save(h);
         });
@@ -274,8 +280,9 @@ public class LibraryService {
         data.put("image", image.getFileName().toString());
         data.put("width", rotated.getWidth());
         data.put("height", rotated.getHeight());
-        data.put("cleared_ocr", clearedOcr);
-        data.put("cleared_ledger", clearedLedger);
+        data.put("cleared_ocr", clearedOcr && !refreshedOcr);
+        data.put("ocr_refreshed", refreshedOcr);
+        data.put("cleared_ledger", false);
         return data;
     }
 
@@ -497,12 +504,16 @@ public LibraryResp list() {
         JSONObject local = new JSONObject();
         local.put("pdf_name", remote.getString("pdf_name"));
         local.put("revision", java.util.UUID.randomUUID().toString());
+        if (remote.getString("revision") != null) local.put("source_revision", remote.getString("revision"));
         for (String key : Arrays.asList("diagnostics", "matching_requires_human", "review_stage", "schema_version", "run_directory")) {
             if (remote.containsKey(key)) local.put(key, remote.get(key));
         }
         local.put("page_count", pageCount > 0 ? pageCount : remote.getIntValue("page_count", 0));
         local.put("ts_utc", remote.getString("ts_utc"));
         if (remote.getString("model") != null) local.put("model", remote.getString("model"));
+        if (remote.getString("model_id") != null) local.put("model_id", remote.getString("model_id"));
+        if (remote.getString("ocr_cache_identity") != null) local.put("ocr_cache_identity", remote.get("ocr_cache_identity"));
+        if (remote.getString("source_pdf_sha256") != null) local.put("source_pdf_sha256", remote.getString("source_pdf_sha256"));
         if (remote.getString("error") != null) local.put("error", remote.getString("error"));
         if (remote.getString("raw_response") != null) local.put("raw_response", remote.getString("raw_response"));
         JSONArray chunks = remote.getJSONArray("chunks");
@@ -845,7 +856,7 @@ public LibraryResp list() {
     }
 
     @Transactional
-    public synchronized JSONObject recognize(String pdfName,
+    public JSONObject recognize(String pdfName,
                                 String prompt, String fields,
                                 String classifyPrompt, String classifySchema,
                                 String ocrPrompt, String model,
@@ -871,9 +882,93 @@ public LibraryResp list() {
         if (StringUtils.isNotBlank(remoteError)) {
             throw new BizException("识别失败: " + remoteError);
         }
+        synchronized (recognitionLock(pdfName)) {
+            JSONObject state = ocrClient.getLibraryRecognition(pdfName);
+            return saveRecognitionResult(pdfName, pages, remote, state);
+        }
+    }
+
+    public JSONObject startRecognition(String pdfName, String prompt, String ocrPrompt,
+                                        String model, boolean forceOcrRefresh) {
+        if (!libraryExists(pdfName)) throw new BizException(404, "PDF 不存在");
+        if (listPagesOnDisk(pdfName).length == 0) throw new BizException("没有可识别的页面");
+        ensureRemoteRegistered(pdfName);
+        return ocrClient.startLibraryRecognition(pdfName, prompt, ocrPrompt, model, forceOcrRefresh);
+    }
+
+    /** 查询不持全局服务锁；只有完成后短暂按卷同步一次结果。 */
+    public JSONObject getRecognition(String pdfName) {
+        if (!libraryExists(pdfName)) throw new BizException(404, "PDF 不存在");
+        JSONObject state;
+        try {
+            state = ocrClient.getLibraryRecognition(pdfName);
+        } catch (org.springframework.web.client.HttpClientErrorException ex) {
+            if (ex.getStatusCode() != org.springframework.http.HttpStatus.NOT_FOUND) throw ex;
+            // Historical local imports are registered only when a task starts.
+            JSONObject idle = new JSONObject();
+            idle.put("pdf_name", pdfName); idle.put("status", "idle"); idle.put("stage", "idle");
+            idle.put("message", "尚未启动识别"); return idle;
+        }
+        if (state != null && "completed".equals(state.getString("status"))) {
+            synchronized (recognitionLock(pdfName)) {
+                String taskId = state.getString("task_id");
+                // Python's cached flag does not imply that this Java copy
+                // belongs to the same model or remote revision. Preserve human
+                // edits only while the underlying remote source is unchanged.
+                JSONObject local = Files.exists(PathUtils.ledgerJson(pdfName)) ? getLedger(pdfName) : null;
+                String localModel = local == null ? null : (local.getString("model_id") != null ?
+                        local.getString("model_id") : local.getString("model"));
+                boolean taskChanged = !state.getBooleanValue("cached") && (local == null ||
+                        !Objects.equals(taskId, local.getString("recognition_task_id")));
+                boolean stateModelChanged = state.getString("model_id") != null &&
+                        !Objects.equals(state.getString("model_id"), localModel);
+                boolean stateIdentityChanged = state.containsKey("ocr_cache_identity") &&
+                        !Objects.equals(state.get("ocr_cache_identity"), local == null ? null : local.get("ocr_cache_identity"));
+                boolean stateRevisionChanged = state.getString("source_revision") != null &&
+                        !Objects.equals(state.getString("source_revision"), local == null ? null : local.getString("source_revision"));
+                boolean needRemoteLedger = local == null || taskChanged || stateModelChanged || stateIdentityChanged || stateRevisionChanged;
+                JSONObject remoteLedger = needRemoteLedger ? ocrClient.getLibraryLedger(pdfName) : null;
+                String remoteModel = remoteLedger == null ? null :
+                        (remoteLedger.getString("model_id") != null ? remoteLedger.getString("model_id") : remoteLedger.getString("model"));
+                boolean modelChanged = remoteModel != null && !Objects.equals(remoteModel, local == null ? null :
+                        (local.getString("model_id") != null ? local.getString("model_id") : local.getString("model")));
+                boolean identityChanged = remoteLedger != null && remoteLedger.containsKey("ocr_cache_identity")
+                        && !Objects.equals(remoteLedger.get("ocr_cache_identity"), local == null ? null : local.get("ocr_cache_identity"));
+                boolean revisionChanged = remoteLedger != null && remoteLedger.getString("revision") != null
+                        && !Objects.equals(remoteLedger.getString("revision"), local == null ? null : local.getString("source_revision"));
+                if (local == null || modelChanged || identityChanged || revisionChanged || (!state.getBooleanValue("cached")
+                        && !Objects.equals(taskId, local.getString("recognition_task_id")))) {
+                    saveRecognitionResult(pdfName, listPagesOnDisk(pdfName), remoteLedger, state);
+                }
+            }
+            int[] pages = listPagesOnDisk(pdfName);
+            if (Arrays.stream(pages).anyMatch(p -> !isValidOcrCache(PathUtils.pageOcrJson(pdfName, p)))) {
+                syncRemotePageOcr(pdfName, pages, getLedger(pdfName));
+            }
+            state.put("local_ready", Arrays.stream(pages).allMatch(p -> isValidOcrCache(PathUtils.pageOcrJson(pdfName, p))));
+        }
+        return state;
+    }
+
+    private JSONObject saveRecognitionResult(String pdfName, int[] pages, JSONObject remote, JSONObject state) {
+        String taskId = state == null ? null : state.getString("task_id");
+        if (Files.exists(PathUtils.ledgerJson(pdfName))) {
+            JSONObject local = getLedger(pdfName);
+            String remoteModel = remote == null ? null :
+                    (remote.getString("model_id") != null ? remote.getString("model_id") : remote.getString("model"));
+            String localModel = local.getString("model_id") != null ? local.getString("model_id") : local.getString("model");
+            Object remoteIdentity = remote == null ? null : remote.get("ocr_cache_identity");
+            Object localIdentity = local.get("ocr_cache_identity");
+            boolean sameModel = remoteModel == null || Objects.equals(remoteModel, localModel);
+            boolean sameIdentity = remoteIdentity == null || Objects.equals(remoteIdentity, localIdentity);
+            String remoteRevision = remote == null ? null : remote.getString("revision");
+            boolean sameRevision = remoteRevision == null || Objects.equals(remoteRevision, local.getString("source_revision"));
+            if (sameModel && sameIdentity && sameRevision && ((state != null && state.getBooleanValue("cached"))
+                    || (taskId != null && taskId.equals(local.getString("recognition_task_id"))))) return local;
+        }
         JSONObject ledger = normalizeRemoteLedger(remote, pages.length);
+        ledger.put("recognition_task_id", taskId);
         saveLedgerCache(pdfName, ledger);
-        // 把远端逐页 OCR 缓存同步到本地，供图片 tab 画框
         syncRemotePageOcr(pdfName, pages, ledger);
         return ledger;
     }
@@ -1514,6 +1609,8 @@ public LibraryResp list() {
             h.setPdfName(pdfName);
             h.setCreatedAt(LocalDateTime.now());
         }
+        if (StringUtils.isBlank(h.getOriginalName())) h.setOriginalName(pdfName);
+        if (h.getPageCount() == null || h.getPageCount() == 0) h.setPageCount(listPagesOnDisk(pdfName).length);
         h.setLedgerRecognized(true);
         h.setLastStatus(LibraryStatus.SUCCESS.name());
         h.setLastResultJson(JSON.toJSONString(ledger));

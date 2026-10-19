@@ -13,6 +13,7 @@ class RuntimeOptions:
     ocr_profile: str = 'batched_gpu'
     dpi: int = 180
     inspection_layout: str = 'auto'
+    artifact_policy: str = 'compact'
 
 
 @dataclass(frozen=True)

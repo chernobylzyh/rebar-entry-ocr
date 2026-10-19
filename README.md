@@ -1,72 +1,90 @@
 # 报审表 OCR 台账提取
 
-当前使用 `前端/` 中的 Vue + Spring Boot 工作台，Python 提供本地 OCR 与自动匹配服务。目标流程：**上传 PDF → 自动提取和四表匹配 → 集中核验最终台账字段 → 导出 Excel**。匹配过程中不要求人工选择、捆绑或确认候选。
+这是一个本地运行的报审表 OCR 与钢筋台账工作台：上传 PDF 后，由 Python 完成页面分类、进场表字段提取、附件 OCR 和四表自动匹配；Java 保存业务状态、人工补正、核验和 Excel 导出；Vue 提供上传、历史、单卷台账、总台账和原图定位界面。
 
-详细规则与接口见 [自动台账说明](docs/AUTOMATIC_LEDGER.md)。当前界面位于 `前端/vue`，旧 Python 静态网页退出主流程；CLI 保留诊断和回放能力。
+当前默认 OCR 模型是 `local-glm`，也可在界面切换到 `local-paddle`。模型权重、PDF、OCR 结果和业务数据库均由运行环境本地生成，不随仓库提交。
+
+## 已实现功能
+
+- 自适应进场数量清单/进场检验记录提取，保留物理行、字段坐标、单位和置信度依据。
+- 工程材料报审表公共字段提取，支持日期、使用部位、材料名称和文件编号证据。
+- 质量证明书、铭牌、送货单的分类、逐卡/逐行读字和证据保存。
+- 两条四表关联路径：清单质保书编号优先，或按规格/牌号寻找铭牌和送货单；规格严格匹配，牌号按有效强度数字匹配。
+- 同页送货单补全、多个铭牌逐卡登记、证书/铭牌冲突保留双方原文和定位。
+- 重复证号合并、全占位模板行过滤、缺失/未匹配/多候选/冲突诊断和字段核验策略。
+- 12 列最终台账、字段来源和原图定位；Java 侧人工补正、核验后导出 Excel/CSV。
+- 异步识别队列、同卷任务复用、模型目录和切换保护；诊断图片按 compact 策略按需恢复。
+
+主要规则见 [自动台账说明](docs/AUTOMATIC_LEDGER.md)，模型维护见 [OCR 模型说明](docs/OCR_MODELS.md)。
 
 ## 环境准备
 
-需要 Python 3.10+、JDK 17+、Maven 和 Node.js 20.19+（推荐 24 LTS，见 `前端/vue/.nvmrc`）。JDK 和 Maven 须加入 PATH；WSL/Linux 使用 Linux JDK。
-
-已有 `ocr` conda 环境可直接激活；新机器先建立合适的 Python 环境，再在仓库根目录安装项目：
+需要 Python 3.10+、JDK 17+、Maven 和 Node.js 20.19+。Python 依赖在 `pyproject.toml`/`requirements.txt`，包括 PaddleOCR/PaddleX、pypdfium2、FastAPI 和 XlsxWriter。Paddle 计算后端按硬件单独安装；当前生产管线使用 Linux/WSL 的 `fcntl` 文件锁。GLM 推理依赖另装在 `.venv-glm/`，权重单独放在 `models/GLM-OCR/`；具体新环境安装步骤见 [GLM 环境准备](docs/GLM_OCR.md#模型与环境)。`pip install -e .` 不会安装 PyTorch/Transformers 或下载 GLM 权重。
 
 ```bash
 python -m pip install -e .
+npm --prefix 前端/vue ci
 ```
 
-Paddle 计算后端需按硬件另行安装，参见 [Paddle 安装说明](https://www.paddlepaddle.org.cn/install/quick)。CPU 使用 `paddlepaddle`，GPU 使用与 CUDA 兼容的 `paddlepaddle-gpu`。首次识别会按需下载模型；模型权重和缓存清单不随仓库分发。
+已有 `ocr` conda 环境可以直接复用。首次安装可能需要联网下载 Python、Maven 和 npm 依赖；模型权重由各运行环境自行准备。
 
 ## 启动
 
-三个终端分别启动下列服务。已有 `ocr` 环境和 `models/paddlex_cache` 缓存可以直接复用。
+在仓库根目录打开三个终端。Python 端口固定使用 8000，Java 使用 8080，Vue 默认使用 5173。
 
 ```bash
-# 仓库根目录，Python OCR 服务，默认使用 gpu:0
-# 使用已有 conda 环境时，先执行 conda activate ocr
-python -m material_ocr serve --port 8000 --data-dir runs/web \
-  --model-cache models/paddlex_cache
+# 终端 1：Python OCR/匹配服务
+PYTHONPATH=src:. python -m material_ocr serve \
+  --port 8000 --data-dir runs/web --model-cache models/paddlex_cache
+```
+
+CPU 环境可增加 `--device cpu --profile complete`；默认使用 `gpu:0` 和 compact 产物策略。模型切换、缓存命名空间和活动任务保护由服务统一管理。
+
+```bash
+# 终端 2：Java 业务服务（本地 H2，无需 MySQL）
+OCR_BASE_URL=http://127.0.0.1:8000 bash 前端/bin/start-local.sh
 ```
 
 ```bash
-# 仓库根目录，Java 业务服务，监听 8080
-export OCR_BASE_URL=http://127.0.0.1:8000
-bash 前端/bin/start-local.sh
-```
-
-本地运行使用上述脚本，无需启动 MySQL。脚本使用 `application-local.yml`，数据库保存在 `前端/runtime/h2/`，文件和构建产物固定使用 `前端/image/`、`前端/dist/`，日志为 `前端/java/business/logs/run.log`。脚本优先使用 `JAVA_HOME`，也可自动复用已存在于 `tools/local-java/jdk17/` 的 Linux JDK；Windows 的 `java.exe` 不能直接作为 Linux Maven 的 Java。其他机器需要 JDK 17+ 和 Maven。首次启动需要联网下载 Maven 依赖，已缓存后可在命令末尾添加 `-o` 离线启动。停止服务按 `Ctrl+C`。
-
-```bash
-# Vue 开发服务，浏览器访问终端显示的地址（默认 http://localhost:5173）
+# 终端 3：Vue 开发服务
 cd 前端/vue
-npm ci
 npm run dev
 ```
 
-可选的 MySQL 部署方式：先按实际环境配置 `application.yml` 的数据库连接并初始化表结构，再使用以下命令替代本地 Java 启动脚本。表结构见 [初始化 SQL](前端/sql/init.sql)，连接配置见 [application.yml](前端/java/business/src/main/resources/application.yml)；`ddl-auto=validate` 要求数据库表已存在。本地 H2 数据保存在独立文件中，不会自动迁移到 MySQL。
+浏览器打开 Vue 终端输出的地址，通常为 `http://127.0.0.1:5173`。Java 本地数据写入 `前端/runtime/h2/`，文件写入 `前端/image/`；这些目录均为本地产物。
+
+停止各终端服务使用 `Ctrl+C`。已有环境启动前先检查实际进程与活动任务，避免重复启动占用端口。
+
+生产构建：
 
 ```bash
-# 仓库根目录，使用已有 MySQL 启动 Java 业务服务
-cd 前端/java/business
-OCR_BASE_URL=http://127.0.0.1:8000 mvn spring-boot:run
+npm --prefix 前端/vue run build
+cd 前端/java/business && mvn package
 ```
 
-Java 项目实际使用 Spring Boot **2.7.18**，编译目标 Java 8；建议使用兼容的 JDK 17 或 21，并配置 Maven。默认部署配置依赖 MySQL，仓库中的示例账号需要按实际情况配置；本地 `local` 配置使用 H2，无需外部数据库。Vue 开发代理转发 `/api` 到 Java 的 8080；Python 默认以此处命令指定的 8000 提供 OCR。CPU 启动增加 `--device cpu --profile complete`。
+## 常用命令与接口
 
-生产构建使用 `cd 前端/vue && npm run build` 和 `cd 前端/java/business && mvn package`；Java 的 `file.frontend` / `file.root` 相对其启动目录解析，需要按部署路径设置。不要直接运行未重新构建的旧 JAR，否则不会包含本次接口与核验约束。
+```bash
+# 历史 Paddle 命令行流程（与 Vue 默认 GLM 入口区分）；输出目录必须是新目录
+PYTHONPATH=src:. python -m material_ocr analyze \
+  --pdf data/input.pdf --out runs/new_analysis --material rebar
 
-## 使用
+# 复用已保存 OCR，只重放匹配
+PYTHONPATH=src:. python -m material_ocr replay \
+  --pdf data/input.pdf --records runs/source/work/inspection/records_all_pages.json \
+  --index runs/source/work/attachments/attachment_index.json \
+  --out runs/new_replay --material rebar
 
-1. 在当前前端上传 PDF，点击整卷识别。使用本地 PaddleOCR，按规则自动匹配。
-2. 查看最终台账；缺失、识别不清晰、信息冲突、重复和多候选均保留原因。点击单元格或诊断的页码，查看对应 PDF 渲染图及定位框；双击单元格补正。
-3. 集中核对关键字段后点击「核验关键字段」，再导出 Excel。缺失必填项不能确认；修改字段或重新识别后须重新核验。匹配候选只用于此阶段查看证据。
-4. Excel 包含「台账」和「字段溯源」，后者保留页码、原始坐标证据和诊断。核验保留原 OCR 观察，不会把人工补正伪装成 OCR 命中。
+# 只检查分类和进场表提取，不执行附件 OCR/四表匹配
+PYTHONPATH=src:. python -m material_ocr.worker inspection \
+  --pdf data/input.pdf --out runs/inspection_only --device gpu:0 \
+  --model-cache models/paddlex_cache --layout adaptive
+```
 
-当前台账为前端约定的 12 列。「供应商是否报审」「送货单编号」没有可靠来源时留空并提示，不自动猜测。数量单位为吨；不累加重复进场记录，不擅自修改质证编号或炉批号。
+网页主入口使用 Vue hash 路由：`/#/upload`、`/#/history`、`/#/history/<pdf_name>`、`/#/library/master`。Python 端提供 `/api/library/<id>/recognition`、`/api/library/<id>/ledger` 等接口，Java 端负责向 Vue 转发并保存业务副本。重新识别前请确认没有未导出的人工补正或正在运行的同卷任务。
 
-## 功能边界与交付
+## 交付边界
 
-扫描模糊、手写送货单、缺失铭牌及未见版式仍可能产生未完整匹配的行，全部进入最终字段核验。其他材料保留适配接口，实际业务能力需另行接入和验证。
+仓库只同步运行源码、配置、依赖锁文件、前端/Java 必需资源和说明文档。`tools/__init__.py` 和 `tools/compare_ocr_ledgers.py` 是生产匹配器的直接依赖，一并交付；其他研发工具不交付。以下内容必须留在本地：业务 PDF、`runs/` OCR/台账缓存、`models/` 模型权重、`前端/image/library/`、`前端/runtime/`、日志、构建目录、实验记录和浏览器缓存。新合作者应使用自己的 PDF 和缓存重新运行，并把验证结果记录在本地 `experiments/`。
 
-交付包含运行代码、配置、依赖锁文件和使用说明。业务 PDF、OCR 原文与图像、审核和导出结果、实验记录、模型缓存、本地依赖和构建产物均保留在运行者本地。
-
-[运行交接](docs/HANDOFF.md) · [接收方核验](docs/ACCEPTANCE.md) · [网页操作](docs/WEB_USAGE.md) · [完整流程](docs/WORKFLOW.md) · [提交范围](docs/GITHUB_SUBMISSION.md)
+进一步维护入口：`TASK_HANDOFF.md`、[网页使用](docs/WEB_USAGE.md)、[完整流程](docs/WORKFLOW.md)、[架构](docs/ARCHITECTURE.md)、[代码地图](docs/CODE_MAP.md)。
