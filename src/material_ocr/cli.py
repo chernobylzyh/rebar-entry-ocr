@@ -1,6 +1,7 @@
 """Stable public commands for the local web app, OCR and evidence replay."""
 import argparse
 import json
+import os
 from pathlib import Path
 
 from material_ocr.materials.base import ExtractedDocuments, RuntimeOptions
@@ -18,6 +19,9 @@ def parser():
     serve.add_argument('--device', default='gpu:0')
     serve.add_argument('--profile', choices=['batched_gpu', 'complete'], default='batched_gpu')
     serve.add_argument('--review-library', type=Path, help='包含已生成审核结果的本地目录，如runs')
+    serve.add_argument('--artifact-policy', choices=['compact', 'full'],
+                       default=os.environ.get('OCR_ARTIFACT_POLICY', 'compact'),
+                       help='compact按需恢复诊断图片；full永久保留所有调试图片')
     analyze = sub.add_parser('analyze', help='从PDF开始完整OCR与匹配')
     replay = sub.add_parser('replay', help='复用同PDF的已保存OCR与原记录，仅重放匹配')
     for command in [analyze, replay]:
@@ -29,6 +33,8 @@ def parser():
         command.add_argument('--layout', default='auto', help='材料适配器支持的检验表版式；钢筋为auto/6_rows/11_rows/adaptive')
         command.add_argument('--model-cache', type=Path, default=Path('models/paddlex_cache'))
         command.add_argument('--run-id')
+        command.add_argument('--artifact-policy', choices=['compact', 'full'],
+                             default=os.environ.get('OCR_ARTIFACT_POLICY', 'compact'))
     replay.add_argument('--records', type=Path, required=True)
     replay.add_argument('--index', type=Path, required=True)
     replay.add_argument('--page-index', type=Path)
@@ -48,7 +54,8 @@ def main(argv=None):
         import uvicorn
         from material_ocr.web.app import create_app
         app = create_app(args.data_dir, model_cache=args.model_cache, device=args.device,
-                         profile=args.profile, review_library=args.review_library)
+                         profile=args.profile, review_library=args.review_library,
+                         artifact_policy=args.artifact_policy)
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
     if args.profile == 'batched_gpu' and not args.device.startswith('gpu'):
@@ -57,6 +64,7 @@ def main(argv=None):
     documents = ExtractedDocuments(args.records.resolve(), args.index.resolve(),
                                    args.page_index.resolve() if args.page_index else None) if args.command == 'replay' else None
     run_pipeline(args.pdf, args.out, args.material,
-                 RuntimeOptions(args.device, args.profile, inspection_layout=args.layout),
+                 RuntimeOptions(args.device, args.profile, inspection_layout=args.layout,
+                                artifact_policy=args.artifact_policy),
                  replay_documents=documents, run_id=args.run_id)
     return 0

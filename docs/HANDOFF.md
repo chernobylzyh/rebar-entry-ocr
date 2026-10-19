@@ -1,43 +1,68 @@
 # 运行代码交接
 
-本次交付运行所需代码和说明。开发者的实验方案、结果摘要、运行登记、业务 PDF、钢筋 OCR / 匹配 / 审核 / 台账结果均保留本地，具体执行和结果核验由接收方完成。
+交付内容为 Vue 前端、Java 业务服务、Python OCR 与钢筋自动匹配代码，以及安装、使用和接收方核验说明。业务扫描 PDF、模型权重与缓存清单、OCR 和台账结果、实验方案与运行记录不随代码交付。
 
-## 能力与入口
+## 当前流程与交付范围
 
-- 本地网页支持 PDF、多文件与目录上传，显示任务进度与日志。
-- 钢筋支持六行 / 十一行检验表、附件分类与 OCR、四表匹配、完整缺失候选和逐组人工捆绑。
-- 台账以独立铭牌为一行，人工核对字段后导出材料台账与字段溯源 XLSX。
-- 四表捆绑 CSV 和审核 JSON 可下载，JSON 可导入恢复。
-- 钢梁、混凝土提供接口与禁用配置示例，实际业务接入待完成。
+主流程为：上传 PDF → 整卷 OCR 与自动四表匹配 → 查看 12 列台账及字段证据 → 集中补正和核验关键字段 → 导出 Excel。候选用于解释自动匹配结果，匹配过程无需逐组人工捆绑。
 
-先读 [README](../README.md) 和 [接收方核验](ACCEPTANCE.md)。阶段输入/输出见 [完整流程](WORKFLOW.md)，操作见 [网页说明](WEB_USAGE.md)，维护入口见 [代码地图](CODE_MAP.md)，材料规则扩展见 [接入指南](MATERIALS.md)。
+- Vue 工作台提供上传、历史记录、单卷结果、总台账、原图定位与字段编辑。
+- Java 服务协调 Python 接口，保存文件和历史摘要，执行最终核验与导出约束。
+- Python 服务提供 OCR、材料字段提取和钢筋匹配规则；缺失、冲突、识别不清或多候选保留诊断。
+- Excel 包含「台账」和「字段溯源」两张工作表，保留字段页码、证据和诊断。
+- 其他材料保留扩展入口，业务规则与真实材料接入需另行完成验证。
 
-## 最小运行安装
+台账的 12 个业务字段为：供应商是否报审、文件编号、材料名称、规格品种、生产单位、供应单位、供货日期与工程材料报审签认日期、使用部位、送货单编号、炉批号、验收数量、质保书编号。数量单位为吨。缺少必填项或数量无效时不能完成最终核验；修改字段或重新识别后须重新核验。人工补正保留原始观察，不将补正值标为 OCR 识别结果。
 
-已有配置好的环境中，在仓库根运行：
+当前 Vue 默认 `local-glm`，可选 `local-paddle`。全新环境还需准备 GLM 独立解释器及权重，按 [GLM 环境准备](GLM_OCR.md#模型与环境) 操作；`pip install -e .` 不包含这些推理依赖。
+
+## 运行环境与启动
+
+接收方需准备 Python 3.10 或以上与兼容的 Paddle 后端、JDK 17 和 Maven、Node.js 20.19 或以上与 npm。前端推荐 Node.js 24 LTS。模型不包含在仓库内，需准备可用模型缓存或允许首次使用时下载；GPU 模式需与设备和 CUDA 环境兼容，CPU 可使用完整处理配置。
+
+在 Python 环境中先执行 `python -m pip install -e .`。之后从仓库根目录分别在三个终端启动：
 
 ```bash
-python -m pip install -e .
-python -m material_ocr serve --port 8080 --data-dir runs/web \
-  --model-cache models/paddlex_cache --review-library runs
+# Python OCR：8000；CPU 增加 --device cpu --profile complete
+python -m material_ocr serve --port 8000 --data-dir runs/web \
+  --model-cache models/paddlex_cache
 ```
 
-浏览器打开 `http://localhost:8080`。新机器先准备 Python 3.10 或以上和对应的 Paddle 后端；GPU 参考安装命令在 README，CPU 启动增加 `--device cpu --profile complete`。首次运行需下载模型。
+```bash
+# Java 业务服务：8080；WSL/Linux 使用 Linux JDK
+OCR_BASE_URL=http://127.0.0.1:8000 bash 前端/bin/start-local.sh
+```
 
-新运行者使用自己的 PDF 和数据目录。浏览器确认绑定同一浏览器、协议、主机和端口；迁移前下载审核 JSON，服务端备份不会自动恢复前端。没有随代码分发的已有任务或人工确认。
+```bash
+# Vue：5173，以终端实际地址为准
+cd 前端/vue
+npm ci
+npm run dev
+```
 
-## 维护约定
+浏览器访问 `http://localhost:5173`。Vue 将业务请求转发到 Java 的 8080，Java 通过 `OCR_BASE_URL` 连接 Python 的 8000。首次运行需要安装依赖并准备模型；已安装环境的后续启动可跳过依赖安装。
 
-上传工作台与审核页面分别在 `web/static/` 和 `review/`。规则在 `materials/rebar/`；网页匹配入口为 `matching.py:rematch()`，字段目录构建仍复用 `matching/catalog.py`。不要删除运行代码中的钢筋实现。
+`start-local.sh` 使用本地 H2 配置，无需安装 MySQL；它仍要求接收方安装 JDK 与 Maven，不依赖随代码分发的开发机工具。MySQL 部署与生产构建以[仓库 README](../README.md)为准，修改数据库配置时须准备对应表结构。
 
-审核模板与 JS 在生成结果时复制到产物；更新代码后重启服务，旧结果基于保存证据 `replay` 到新目录。运行目录包含输入哈希、配置、日志、源码快照和状态，记录由程序自动写入，不依赖开发者的顶层实验目录。
+## 数据与维护入口
 
-GPU 附件默认 batch 32，每五页独立进程、逐页检查点，OOM 时 batch 6 重试未完成页。跨服务重启续跑尚未实现。是否新 OCR 以任务 `summary.json` / `experiment/metadata.json` 顶层 `new_ocr_executed` 为准。
+| 路径 | 用途 |
+| --- | --- |
+| `前端/vue/src/` | Vue 页面、接口封装与状态管理。 |
+| `前端/java/business/src/` | Java 接口、业务约束、历史摘要与 Excel 导出。 |
+| `前端/bin/start-local.sh` | WSL/Linux 本地 Java 启动入口。 |
+| `src/material_ocr/web/` | Python 服务与前端适配接口。 |
+| `src/material_ocr/materials/rebar/` | 钢筋字段提取、自动匹配及核验规则。 |
+| `src/material_ocr/ocr/` | OCR 与附件信息处理。 |
+| `runs/web/` | 启动命令指定的 Python 运行数据目录。 |
+| `前端/image/` | Java 保存的输入文件、图片、OCR 缓存与台账。 |
+| `前端/runtime/h2/` | 本地历史数据库。 |
+| `前端/java/business/logs/run.log` | Java 日志。 |
 
-四表确认与台账字段确认分别保存，改关联或字段版本使旧确认失效。CSV 导出四表清单，完整台账为双工作表 XLSX；自定义模板、写回 PDF / Word、任意新版式和其他材料实际填表尚待扩展。
+模型缓存目录由 `--model-cache` 指定。以上运行数据和缓存由接收方管理，不能当作源码提交。迁移本地数据时一并保留 Python 数据、Java 文件数据和对应历史数据库；复制 H2 文件前先停止 Java。H2 与 MySQL 相互独立，不会自动迁移数据。
 
-## 交付与核验边界
+## 接收方核验与边界
 
-当前分支 `phase2-form-matching`，具体暂存范围见 [提交说明](GITHUB_SUBMISSION.md)。本轮没有 commit / push，也没有重跑业务 PDF。研发工具、测试、模型清单和历史资料同样留在开发者本地。
+按[接收方运行与核验](ACCEPTANCE.md)检查安装、服务链路、自己的业务材料、最终核验、Excel 内容和重启后的数据持久化。记录通过、失败和未覆盖项，反馈可复现的操作与必要日志。仓库可安装或服务可启动，不等于接收方业务材料的字段准确性已经通过。
 
-接收方应核验自己的页面分类、字段与关联、候选库存变化、审核恢复、台账单位和导出内容，并保存失败日志和核验意见。原始统计包含重复来源，候选齐全不代表已完成字段确认或已测得总体准确率。
+模糊扫描、手写内容、缺失附件、冲突来源及未知版式仍需依据诊断补正。不得为完成核验猜测业务字段，也不能将单份材料的验证结论扩大到未覆盖的材料或版式。交接中不包含已有处理任务或人工核验结论；接收方使用自己的输入与数据目录完成核验。

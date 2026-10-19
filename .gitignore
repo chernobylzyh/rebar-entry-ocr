@@ -6,15 +6,19 @@ data/
 build/
 dist/
 .venv/
+/.venv-glm/
 *.py[cod]
 .paddlex/
+/.storage-maintenance.lock
 
 # Business scans are local inputs, never repository fixtures
 *.pdf
 /钢筋报审文件/
 # Development records, tools and historical handoffs stay local
 /experiments/
-/tools/
+/tools/*
+!/tools/__init__.py
+!/tools/compare_ocr_ledgers.py
 /tests/
 /docs/history/
 /docs/MIGRATION.md
@@ -24,3 +28,9 @@ dist/
 
 # Local ledger-format reference
 /报审表字文字内容提取项目说明.docx
+
+# Frontend runtime data and generated dependency caches
+/前端/image/
+/前端/logs/
+/前端/runtime/
+/前端/vue/.vite/

@@ -210,10 +210,17 @@ class AdaptiveBackend:
             started = time.perf_counter()
             try:
                 from paddleocr import TableRecognitionPipelineV2
-                self.pipeline = TableRecognitionPipelineV2(paddlex_config=model_config(layout=True), device=self.device)
+                runtime = {'enable_mkldnn': False} if self.device == 'cpu' else {}
+                self.pipeline = TableRecognitionPipelineV2(paddlex_config=model_config(layout=True), device=self.device, **runtime)
             except Exception as exc:
-                self.initialization_error = f"Adaptive model initialization failed: {exc}"
-                raise
+                causes, cause = [], exc
+                while cause is not None:
+                    message = str(cause)
+                    if message not in causes:
+                        causes.append(message)
+                    cause = cause.__cause__
+                self.initialization_error = "自适应表格模型初始化失败：" + "；".join(causes)
+                raise RuntimeError(self.initialization_error) from exc
             self.initialization_seconds = time.perf_counter()-started
         options = {"use_table_orientation_classify": False, "use_wired_table_cells_trans_to_html": True,
                    "use_wireless_table_cells_trans_to_html": True, "use_ocr_results_with_table_cells": True}

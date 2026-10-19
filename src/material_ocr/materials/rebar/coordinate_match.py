@@ -58,8 +58,13 @@ def load_tokens(data):
         raise ValueError("OCR texts/boxes/scores lengths differ; refusing partial alignment.")
     tokens = []
     for index, (text, box, score) in enumerate(zip(texts, boxes, scores)):
-        score = float(score)
-        if not isinstance(text, str) or not math.isfinite(score) or not 0 <= score <= 1:
+        # GLM cell OCR has no calibrated word confidence.  Preserve an
+        # unknown score instead of coercing it to a fabricated value; the
+        # geometry and text still go through the same row/column matcher.
+        if score is not None:
+            score = float(score)
+        if (not isinstance(text, str) or
+                (score is not None and (not math.isfinite(score) or not 0 <= score <= 1))):
             raise ValueError("Invalid OCR text or score.")
         tokens.append({"ocr_index": index, "source": source, "text": text,
                        "bbox": rectangle(box), "ocr_score": score})
@@ -133,7 +138,7 @@ def assign_texts(cells, tokens, min_coverage=.80, min_margin=.15, min_score=.95)
         if status == "assigned":
             cell = next(c for c in cells if c["cell_id"] == best[1])
             cell["tokens"].append(match)
-            if token["ocr_score"] < min_score:
+            if token["ocr_score"] is not None and token["ocr_score"] < min_score:
                 cell["issues"].append(f"low_ocr_score:{token['ocr_index']}")
     for cell in cells:
         # Cluster OCR lines by centers, then sort each line by x. Preserve both
@@ -283,7 +288,8 @@ def isolated_dot_blank_evidence(related, fields, unresolved):
     if len(pairs) != 1:
         return None
     cell, token = pairs[0]
-    if token["text"].strip() not in (".", "。", "·", "．") or token["ocr_score"] >= .30:
+    if (token["text"].strip() not in (".", "。", "·", "．") or
+            token["ocr_score"] is None or token["ocr_score"] >= .30):
         return None
     b, c = token["bbox"], cell["bbox"]
     wr, hr = (b[2]-b[0])/(c[2]-c[0]), (b[3]-b[1])/(c[3]-c[1])
@@ -307,7 +313,8 @@ def assemble_records(cells, grid, matches, min_score=.95):
     if len(serial_candidates) == 1 and cells:
         serial_y = serial_candidates[0]["bbox"][1]
         left, right = min(c["bbox"][0] for c in cells), max(c["bbox"][2] for c in cells)
-        title_tokens = sorted([m for m in matches if m["ocr_score"] >= .90
+        title_tokens = sorted([m for m in matches if
+            (m["ocr_score"] is None or m["ocr_score"] >= .90)
             and (m["bbox"][1]+m["bbox"][3])/2 < serial_y
             and left <= (m["bbox"][0]+m["bbox"][2])/2 <= right],
             key=lambda m: (m["bbox"][1], m["bbox"][0]))

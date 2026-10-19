@@ -16,6 +16,7 @@ from material_ocr.materials.rebar.submission import preview_submission, extract_
 from material_ocr.materials.rebar.submission_duplicates import submission_duplicate_candidates
 from material_ocr.ocr.orientation import create_orientation, predict_orientation, rotate_page
 from material_ocr.paths import rebar_config
+from material_ocr.storage_artifacts import register_derivative
 
 
 def pdf_image(pdf, page_index, dpi):
@@ -104,8 +105,16 @@ def run(args, *, progress=None):
                     crop = upright[:round(upright.shape[0]*.40)]
                     path = out/"headers"/f"p{page_no:03d}_{args.scan_dpi}_rot{rotation}.png"
                     _,blocks = ocr_cell(engine,crop,path)
+                    register_derivative(path,pdf_path,[{'rotate':rotation},
+                        {'crop':[0,0,int(crop.shape[1]),int(crop.shape[0])]}],
+                        kind='inspection_header',pdf_page=page_no,dpi=args.scan_dpi)
+                    header_preview=path.with_suffix('.jpg')
+                    ratio=min(1.,800/max(crop.shape[:2]))
+                    cv2.imwrite(str(header_preview),cv2.resize(crop,None,fx=ratio,fy=ratio),
+                                [cv2.IMWRITE_JPEG_QUALITY,80])
                     result = classify_header(blocks,crop.shape[0])
-                    attempt = {"dpi":args.scan_dpi,"rotation_ccw":rotation,"header_image":str(path.relative_to(out)),**result}
+                    attempt = {"dpi":args.scan_dpi,"rotation_ccw":rotation,"header_image":str(path.relative_to(out)),
+                               "header_preview":str(header_preview.relative_to(out)),**result}
                     entry['attempts'].append(attempt)
                     attempts.append(attempt)
                     if result['decision'] != 'review' and (score >= .90 or result['decision'] in ('target','submission')):
@@ -122,8 +131,16 @@ def run(args, *, progress=None):
                     crop = upright[:round(upright.shape[0]*.40)]
                     path = out/'headers'/f"p{page_no:03d}_300_rot{selected['rotation_ccw']}.png"
                     _,blocks = ocr_cell(engine,crop,path)
+                    register_derivative(path,pdf_path,[{'rotate':selected['rotation_ccw']},
+                        {'crop':[0,0,int(crop.shape[1]),int(crop.shape[0])]}],
+                        kind='inspection_header',pdf_page=page_no,dpi=300)
+                    header_preview=path.with_suffix('.jpg')
+                    ratio=min(1.,800/max(crop.shape[:2]))
+                    cv2.imwrite(str(header_preview),cv2.resize(crop,None,fx=ratio,fy=ratio),
+                                [cv2.IMWRITE_JPEG_QUALITY,80])
                     result = classify_header(blocks,crop.shape[0])
-                    selected = {'dpi':300,'rotation_ccw':selected['rotation_ccw'],'header_image':str(path.relative_to(out)),**result}
+                    selected = {'dpi':300,'rotation_ccw':selected['rotation_ccw'],'header_image':str(path.relative_to(out)),
+                                'header_preview':str(header_preview.relative_to(out)),**result}
                     entry['attempts'].append(selected)
                 result = dict(selected)
                 if targets and others or len(targets)>1:
@@ -142,6 +159,8 @@ def run(args, *, progress=None):
     submissions = []
     blank_candidates = []
     adaptive_engine = None
+    if progress:
+        progress('extract', 0, sum(p['decision'] in ('target', 'submission') for p in manifest['pages']), '开始报审与检验表提取')
     for entry in manifest["pages"]:
         if entry["decision"] not in ("target", "submission"):
             continue
@@ -268,7 +287,7 @@ def run(args, *, progress=None):
         'review_pages':manifest['review_pages'],'ready_for_search':False})
     rows=[]
     for entry in manifest["pages"]:
-        thumbnails=''.join(f'<a href="{a["header_image"]}"><img src="{a["header_image"]}" width="360"></a>' for a in entry["attempts"])
+        thumbnails=''.join(f'<a href="{a.get("header_preview",a["header_image"])}"><img src="{a.get("header_preview",a["header_image"])}" width="360"></a>' for a in entry["attempts"])
         links=''
         if "run_dir" in entry:
             preview_name = ('submission_page_preview.png' if entry['decision']=='submission' else

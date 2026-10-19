@@ -22,7 +22,23 @@ COLUMNS = [
     dict(key='certificate_no', label='质保书编号', role='certificate', required=True),
     dict(key='file_no', label='文件编号', role='approval', required=False),
 ]
-COMPANY = re.compile(r'[\u4e00-\u9fffA-Za-z（）()·]{3,}(?:有限责任公司|股份有限公司|有限公司)')
+# A short printed group heading is a valid original value. Keep 集团 last so
+# full legal company names are retained when both forms occur in the OCR.
+COMPANY = re.compile(r'[\u4e00-\u9fffA-Za-z（）()·]{2,}(?:有限责任公司|股份有限公司|有限公司|集团)')
+# Longest labels must come first: stripping ``生产厂`` from ``生产厂家``
+# would leave 家 attached to an otherwise valid, unpunctuated company name.
+COMPANY_LABEL = re.compile(r'^(?:生产厂家|制造厂家|生产单位|生产企业|生产厂商|制造商|生产厂|厂家|供应单位|供货单位|供应商|供货商|供方|(?:MANUFACTURER|PRODUCER|MILL|SUPPLIER|VENDOR|SELLER)(?:NAME)?(?![A-Z]))[:：]?',re.I)
+PRODUCER_LABEL = re.compile(r'^(?:生产厂家|制造厂家|生产单位|生产企业|生产厂商|制造商|生产厂|厂家|(?:MANUFACTURER|PRODUCER|MILL)(?:NAME)?(?![A-Z]))[:：]?',re.I)
+SUPPLIER_LABEL = re.compile(r'^(?:供应单位|供货单位|供应商|供货商|供方|(?:SUPPLIER|VENDOR|SELLER)(?:NAME)?(?![A-Z]))[:：]?',re.I)
+CUSTOMER_LABEL = re.compile(r'购货|收货|客户|需方|建设单位|监理单位|(?<![A-Z])(?:BUYER|CUSTOMER|PURCHASER|CONSIGNEE|SOLDTO|SHIPTO)(?:NAME)?(?![A-Z])',re.I)
+COMPANY_LEGAL_SUFFIX = re.compile(r'(?:有限责任公司|股份有限公司|有限公司)$')
+# Legal-company extraction deliberately excludes bare group/industry labels
+# unless a reviewed delivery form explicitly identifies the printed heading as
+# its supplier.  The 2025.12.6 forms use this exact association title.
+GENERIC_COMPANY_HEADINGS = frozenset(('钢铁集团','特钢集团','行业集团','钢铁行业集团','钢筋行业集团'))
+GENERIC_DELIVERY_HEADINGS = frozenset(('上海市钢筋混凝土结构用钢筋行业',))
+DELIVERY_TITLE = re.compile(r'^(?:.*公司)?(?:送货单|发货单|送货清单|发货清单)$')
+DELIVERY_NUMBER = re.compile(r'^N[OＯ0][.．:：#\-]*', re.I)
 # Unicode word boundaries treat Chinese labels and Ф as letters. ASCII-only
 # guards allow ``牌号HRB400EФ10`` and delivery cells ``16*12HRB500E`` without
 # accepting a damaged prefix or a four-digit OCR grade.
@@ -34,6 +50,14 @@ DATE = re.compile(r'(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*�
 
 def compact(value):
     return re.sub(r'\s+', '', str(value or ''))
+
+
+def _company_names(value, *, allow_generic=False):
+    text = COMPANY_LABEL.sub('',compact(value),count=1)
+    names = [name for name in COMPANY.findall(text) if name not in GENERIC_COMPANY_HEADINGS]
+    if allow_generic and text in GENERIC_DELIVERY_HEADINGS:
+        names.append(text)
+    return names
 
 
 def decimal_text(value):
@@ -72,6 +96,11 @@ def center(block):
 def page_blocks(page, candidate=None):
     # Use page/entity OCR rather than tiny field crops with different local axes.
     regions = [r for r in page.get('regions', []) if r['region_id'] == f"p{page['page_no']:03d}_full"]
+    form_region = candidate.get('form_region_id') if candidate else None
+    if form_region:
+        scoped = [r for r in page.get('regions', []) if r['region_id'] == form_region]
+        if scoped:
+            return [dict(b,region_id=r['region_id']) for r in scoped for b in r.get('blocks',[])]
     entity = candidate.get('entity_key') if candidate else None
     if entity and entity != 'full' and entity != 'raw-labelled':
         scoped = [r for r in page.get('regions', []) if r.get('entity_key') == entity
@@ -87,7 +116,7 @@ def page_blocks(page, candidate=None):
         # Those entities cover the original page once; adding full-form retries
         # would duplicate headings at slightly different coordinates.
         regions = [r for r in page.get('regions', [])
-                   if re.fullmatch(r'p\d+_full_entity\d+', r['region_id'])]
+                   if re.fullmatch(r'p\d+_full(?:_entity\d+)+', r['region_id'])]
     if not regions:
         regions = [r for r in page.get('regions', []) if '_full' in r['region_id'] and not r.get('row_id')]
     if not regions:
@@ -148,6 +177,8 @@ def specification_field(grades, sizes, warnings=()):
 def bind_source(fields, candidate, role):
     for value in fields.values():
         value['source_role'] = role
+        for ev in value.get('review_locations', []):
+            ev.update(source_role=role, candidate_id=candidate['candidate_id'], row_id=candidate.get('row_id'))
         for item in value.get('candidates', []):
             for ev in item.get('evidence', []):
                 ev.update(source_role=role, candidate_id=candidate['candidate_id'], row_id=candidate.get('row_id'))
@@ -204,6 +235,36 @@ def specification_parts(page, blocks, method, *, specification_column=False):
                     sizes.append(dict(value=value, evidence=[evidence(page, block, method+'_split_mm'),
                         evidence(page, right[0], method+'_diameter_unit')]))
     return field(grades), field(sizes)
+
+
+def delivery_grade_candidates(page, blocks, method, *, grade_column=False):
+    """Retain OCR grade words only inside a delivery grade/specification cell.
+
+    A labelled grade column can preserve its entire short OCR cell even when
+    the alphabetic prefix is damaged.  A combined specification cell requires
+    an explicit grade-like token, so its diameter/length/weight numbers are
+    never borrowed as a grade.  No alphabetic OCR character is corrected here.
+    """
+    from .matching import grade_number
+    candidates = []
+    # A preceding length digit is valid in merged cells such as 16*12HBE500E.
+    token_pattern = re.compile(r'(?<![A-Z])(?:[A-Z]{1,8}|[0-9]级[A-Z]{0,8})'
+                               r'[0-9]{3,8}[A-Z]{0,3}(?![A-Z0-9])', re.I)
+    for block in blocks:
+        raw = compact(block.get('text'))
+        if not raw or len(raw) > 40:
+            continue
+        if grade_column:
+            # Keep contradictory/damaged numeric values as raw evidence too.
+            # The join helper will reject missing/nonunique strength digits.
+            if re.search(r'[0-9]{3}', raw) and not GRADE.fullmatch(raw):
+                candidates.append(candidate_value(page, block, raw, method + '_raw_grade_column'))
+            continue
+        for match in token_pattern.finditer(raw):
+            value = match.group()
+            if grade_number(value) and not GRADE.fullmatch(value):
+                candidates.append(candidate_value(page, block, value, method + '_raw_grade_token'))
+    return candidates
 
 
 def same_line(blocks, label):
@@ -291,8 +352,53 @@ def heat_anchor(blocks, heat):
     return min(matches, key=lambda b: len(compact(b['text']))) if matches else None
 
 
+def _excluded_company_owner(block, blocks, role):
+    """Read ownership on the value itself or its neighbouring label box."""
+    opposite = PRODUCER_LABEL if role == 'delivery' else SUPPLIER_LABEL
+    def excluded(text):
+        return CUSTOMER_LABEL.search(text) or opposite.match(text)
+    if excluded(compact(block.get('text'))):
+        return True
+    return any(excluded(compact(other.get('text')))
+               and bbox(other)[2] <= bbox(block)[0]+3
+               and bbox(block)[0]-bbox(other)[2] <= max(160,(bbox(block)[3]-bbox(block)[1])*12)
+               for other in same_line(blocks,block) if other is not block)
+
+
+def _plate_heading_before_heat(blocks, target, *, after=float('-inf')):
+    """Keep the first company inside one card, beyond legacy goods above it."""
+    target_y = center(target)[1] if target else float('inf')
+    headers = [b for b in blocks if _company_names(b.get('text')) and center(b)
+               and after < center(b)[1] < target_y
+               and not _excluded_company_owner(b,blocks,'nameplate')]
+    if not headers:
+        return None
+    grades = [b for b in blocks if center(b) and center(b)[1] > after
+              and GRADE.search(compact(b.get('text')))]
+    grade = (min(grades, key=lambda b: abs(center(b)[1]-target_y)) if target
+             else max(grades, key=lambda b: center(b)[1])) if grades else None
+    limit = min(target_y,center(grade)[1]) if grade else target_y
+    preceding = [b for b in headers if center(b)[1] < limit]
+    older_grades = [center(b)[1] for b in grades if grade is not None
+                    and center(b)[1] < center(grade)[1]
+                    and any(center(b)[1] < center(h)[1] for h in preceding)]
+    if older_grades:
+        preceding = [b for b in preceding if center(b)[1] > max(older_grades)]
+    return min(preceding or headers, key=lambda b: center(b)[1])
+
+
 def plate_scope(page, candidate, peers):
     blocks = page_blocks(page, candidate)
+    if str(candidate.get('entity_key', '')).startswith('card-'):
+        # Older physical crops can begin in the delivery table above a pasted
+        # card. Its customer company and goods grade must not become card data.
+        heats = candidate.get('heat_lots', [])
+        target = heat_anchor(blocks, heats[0]) if len(heats) == 1 else None
+        if target:
+            header = _plate_heading_before_heat(blocks,target)
+            if header:
+                blocks = [b for b in blocks if center(b) and center(b)[1] >= bbox(header)[1]-15]
+        return blocks, []
     heats = candidate.get('heat_lots', [])
     if len(heats) != 1:
         return [], ['铭牌炉批号未唯一定位，请按原图补正字段。']
@@ -304,34 +410,41 @@ def plate_scope(page, candidate, peers):
         global_blocks = page_blocks(page)
         # Layout splitting can put a plate's company header in the delivery crop.
         # Recall only a nearby header below the delivery title and above this heat.
-        if target and not any(COMPANY.search(compact(b['text'])) for b in blocks):
+        if target and not any(_company_names(b['text']) for b in blocks):
             ty = center(target)[1]
-            titles_before = [center(b)[1] for b in global_blocks if '送货单' in b['text'] and center(b) and center(b)[1] < ty]
+            titles_before = [center(b)[1] for b in global_blocks if DELIVERY_TITLE.fullmatch(compact(b['text'])) and center(b) and center(b)[1] < ty]
             low = max(titles_before) if titles_before else float('-inf')
-            headers = [b for b in global_blocks if COMPANY.search(compact(b['text'])) and center(b)
+            headers = [b for b in global_blocks if _company_names(b['text']) and center(b)
                        and low < center(b)[1] < ty and ty-center(b)[1] < 550]
             if headers:
                 blocks = blocks + [min(headers, key=lambda b: ty-center(b)[1])]
         # A mixed sheet contains a plate above its delivery title.
-        titles = [bbox(b)[1] for b in global_blocks if '送货单' in b['text'] and bbox(b)]
+        titles = [bbox(b)[1] for b in global_blocks if DELIVERY_TITLE.fullmatch(compact(b['text'])) and bbox(b)]
         if titles and target and center(target)[1] < min(titles):
             title_y = min(titles)
-            supplier_headers = [bbox(b)[1] for b in blocks if COMPANY.search(compact(b['text']))
+            supplier_headers = [bbox(b)[1] for b in blocks if _company_names(b['text'])
                                 and center(b) and 0 < title_y-center(b)[1] < 240]
             boundary = max(supplier_headers) if supplier_headers else title_y
             return [b for b in blocks if center(b) and center(b)[1] < boundary-15], []
         if titles and target and center(target)[1] > max(titles):
             preceding_title = max(y for y in titles if y < center(target)[1])
-            headers = [bbox(b)[1] for b in blocks if COMPANY.search(compact(b['text'])) and center(b)
+            headers = [bbox(b)[1] for b in blocks if _company_names(b['text']) and center(b)
                        and preceding_title < center(b)[1] < center(target)[1]
                        and center(target)[1]-center(b)[1] < 550]
             if headers:
                 return [b for b in blocks if center(b) and center(b)[1] >= max(headers)-15], []
+            # A clipped producer heading may survive only below the heat.
+            # Keep the neighbourhood of this card, never the delivery header.
+            nearby_grades = [b for b in blocks if center(b) and GRADE.search(compact(b.get('text')))
+                             and center(b)[1]>preceding_title]
+            near = min(nearby_grades,key=lambda b:abs(center(b)[1]-center(target)[1])) if nearby_grades else target
+            top = min(center(target)[1],center(near)[1])-max(80,(bbox(near)[3]-bbox(near)[1])*3)
+            return [b for b in blocks if center(b) and center(b)[1]>=top], []
         return blocks, []
     if not target or any(a is None for _, a in anchors) or len(anchors) != len(peers):
         return [], ['同页多个铭牌的 OCR 范围未可靠区分，请核验原图后填写。']
     # Each card starts with a company header before its labelled heat.
-    companies = [b for b in blocks if COMPANY.search(compact(b['text'])) and center(b)]
+    companies = [b for b in blocks if _company_names(b['text']) and center(b)]
     starts = []
     for peer, anchor in anchors:
         ax, ay = center(anchor)
@@ -355,21 +468,280 @@ def plate_scope(page, candidate, peers):
     return [b for b in blocks if center(b) and low <= center(b)[axis] < high], []
 
 
+def source_locations(page, candidate, blocks, role):
+    """Keep a useful source anchor even when OCR found no field value."""
+    regions = [r for r in page.get('regions', []) if r.get('entity_key') == candidate.get('entity_key')
+               and r.get('polygon_page')]
+    if regions:
+        return [dict(page_no=page['page_no'], region_id=r['region_id'],
+                     polygon_page=deepcopy(r['polygon_page']), source_role=role,
+                     method='missing_field_source_region') for r in regions[:1]]
+    located = [b for b in blocks if center(b)]
+    if located:
+        top = min(center(b)[1] for b in located)
+        located = [b for b in located if center(b)[1] <= top+70]
+        return [evidence(page, b, 'missing_field_source_heading') for b in located[:3]]
+    return [dict(page_no=page['page_no'], polygon_page=None, source_role=role,
+                 source_image=page.get('source_image'), method='missing_field_source_page')]
+
+
+def company_heading(page, blocks, method, *, role, title=None):
+    """Read a company's own heading; never substitute customer/body companies."""
+    located = [b for b in (delivery_nonplate_blocks(page, blocks) if role == 'delivery' else blocks) if center(b)]
+    candidates = []
+    for b in located:
+        text = compact(b.get('text'))
+        # Labels can occupy a separate OCR box from their company value. Such
+        # customers and opposite-role body fields are neither headings nor
+        # conflicting companies for this role.
+        if _excluded_company_owner(b,located,role):
+            continue
+        # OCR may split a centred heading into a company prefix and suffix.
+        # Only contiguous boxes on that same line can supply the prefix.
+        prefix_blocks = [other for other in same_line(located,b) if other is not b
+                         and bbox(other)[2] <= bbox(b)[0]+3
+                         and 0 <= bbox(b)[0]-bbox(other)[2] <= max(25,(bbox(b)[3]-bbox(b)[1])*2)
+                         and re.fullmatch(r'[\u4e00-\u9fff（）()·]{2,}',compact(other.get('text')))
+                         and not re.search(r'单位|生产厂|公司|品名|材质|名称|牌号',compact(other.get('text')))
+                         and not COMPANY_LABEL.match(compact(other.get('text')))
+                         and not CUSTOMER_LABEL.search(compact(other.get('text')))]
+        if prefix_blocks and re.match(r'^(?:供应链|钢铁|特钢|实业|贸易|建材|商贸|材料|集团|有限|股份)',text):
+            prefix=max(prefix_blocks,key=lambda other:bbox(other)[2])
+            joined=compact(prefix['text'])+text
+            if COMPANY.fullmatch(joined) and _company_names(joined):
+                b=deepcopy(b)
+                b['text']=joined
+                for coordinate in ('polygon_page','polygon_ocr'):
+                    points=(prefix.get(coordinate) or [])+(b.get(coordinate) or [])
+                    if points:
+                        xs,ys=zip(*points);b[coordinate]=[[min(xs),min(ys)],[max(xs),min(ys)],[max(xs),max(ys)],[min(xs),max(ys)]]
+                text=joined
+        # Strip labels before the regex so they do not become part of a name.
+        for company in _company_names(text, allow_generic=role == 'delivery'):
+            candidates.append((b, company))
+    all_candidates = candidates
+    if title is not None:
+        ty = center(title)[1]
+        th = bbox(title)[3]-bbox(title)[1]
+        candidates = [(b,c) for b,c in candidates if ty-max(240,th*7) <= center(b)[1] <= ty+th*.6]
+    if not candidates:
+        return [], ['送货单顶部供应公司未识别，请核对送货单原图。' if role == 'delivery'
+                    else '独立铭牌顶部生产公司未识别，请核对该铭牌原图。'], []
+    top = min(center(b)[1] for b,_ in candidates)
+    # Same-line distinct companies are a genuine ambiguity; a lower company
+    # in a footer is not the top heading specified by the ledger contract.
+    first = [(b,c) for b,c in candidates if center(b)[1]-top <= max(15,(bbox(b)[3]-bbox(b)[1])*.8)]
+    same_company = {}
+    for block,company in sorted(first,key=lambda item:(center(item[0])[1],bbox(item[0])[0])):
+        same_company.setdefault(COMPANY_LEGAL_SUFFIX.sub('',company),(block,company))
+    first = list(same_company.values())
+    warnings = []
+    if role == 'delivery' and title is not None and len(first) == 1:
+        company_box, title_box = bbox(first[0][0]), bbox(title)
+        gap = max(title_box[0]-company_box[2], company_box[0]-title_box[2], 0)
+        if gap > max((title_box[2]-title_box[0])*.75, (title_box[3]-title_box[1])*4):
+            # A neighbouring card can have the highest company on this page.
+            # Without a reliable physical boundary, keep locations for review
+            # instead of treating that off-axis heading as a supplier value.
+            return [], ['公司名称横向明显偏离送货单标题，可能属于同页铭牌；供应单位需核对送货抬头。'], [
+                evidence(page,b,method+'_off_axis_review') for b,_ in candidates]
+    if role == 'nameplate':
+        labels = [b for b in located if GRADE.search(compact(b.get('text')))]
+        if labels and top > min(center(b)[1] for b in labels):
+            warnings.append('铭牌顶部公司未完整识别，仅识别到同卡生产厂公司，请核对铭牌顶部。')
+    top_companies = {COMPANY_LEGAL_SUFFIX.sub('',company) for _,company in first}
+    body_conflicts = [(b,c) for b,c in all_candidates if COMPANY_LEGAL_SUFFIX.sub('',c) not in top_companies
+                      and center(b)[1]-top > max(15,(bbox(b)[3]-bbox(b)[1])*.8)]
+    if body_conflicts:
+        source = '送货单' if role == 'delivery' else '铭牌'
+        destination = '供应单位' if role == 'delivery' else '生产单位'
+        others = '、'.join(dict.fromkeys(company for _,company in body_conflicts))
+        warnings.append(f'{source}顶部公司与正文公司（{others}）不一致，{destination}保留顶部公司，请核对原图。')
+    locations = [evidence(page,b,method) for b,_ in first]
+    locations.extend(evidence(page,b,method+'_body_company_conflict') for b,_ in body_conflicts)
+    return [candidate_value(page,b,c,method) for b,c in first], warnings, locations
+
+
+def _upright_evidence_center(page, ev):
+    if ev.get('polygon_ocr'):
+        return center(ev)
+    polygon = ev.get('polygon_page')
+    if not polygon:
+        return None
+    size = page.get('pixel_size')
+    angle = int(page.get('rotation_ccw',0)) % 360
+    if angle and not size:
+        return None
+    def turn(p):
+        x,y = p
+        if angle == 90:return y,size[0]-1-x
+        if angle == 180:return size[0]-1-x,size[1]-1-y
+        if angle == 270:return size[1]-1-y,x
+        return x,y
+    points = [turn(p) for p in polygon]
+    return (sum(p[0] for p in points)/len(points),sum(p[1] for p in points)/len(points))
+
+
+def delivery_nonplate_blocks(page, blocks):
+    """Exclude known physical cards before reading a neighbouring dispatch form.
+
+    Region polygons use original PDF-image axes; card IDs and OCR boxes use
+    upright axes. Compare in upright axes without modifying saved evidence.
+    """
+    rectangles = []
+    owned = set()
+    global_blocks = page_blocks(page)
+    for region in page.get('regions', []):
+        entity = str(region.get('entity_key') or '')
+        if not (entity.startswith('card-') or region.get('layout_role') == 'physical_nameplate'):
+            continue
+        card_blocks = region.get('blocks', [])
+        polygon = region.get('polygon_page')
+        points = [_upright_evidence_center(page, {'polygon_page':[p]}) for p in polygon] if polygon else []
+        points = [p for p in points if p]
+        if points:
+            xs,ys = zip(*points)
+            rectangle = (min(xs),min(ys),max(xs),max(ys))
+        else:
+            match = re.fullmatch(r'card-(\d+)-(\d+)-(\d+)-(\d+)',entity)
+            rectangle = tuple(map(int,match.groups())) if match else None
+        # Old card crops sometimes begin in the delivery table or even its
+        # heading. Only remove the actual plate below its producer heading;
+        # ownership of an oversized crop is not ownership of every OCR block.
+        markers = [b for b in global_blocks+card_blocks
+                   if (DELIVERY_TITLE.fullmatch(compact(b.get('text')))
+                       or rectangle and center(b) and center(b)[1] < rectangle[1]
+                       and DELIVERY_NUMBER.match(compact(b.get('text'))))
+                   and center(b) and (not rectangle or
+                       rectangle[0] <= center(b)[0] < rectangle[2]
+                       and center(b)[1] < rectangle[3])]
+        floor = None
+        if markers:
+            anchors = [heat_anchor(card_blocks,item.get('value'))
+                       for item in region.get('extracted_fields',{}).get('heat_lot_no',[])
+                       if item.get('value') and item.get('validation_status') in (None,'accepted')]
+            anchors = [b for b in anchors if b] or [b for b in card_blocks if center(b)
+                       and re.search(r'炉(?:批)?号|批号|(?:BA)?TCHNO',compact(b.get('text')),re.I)]
+            target_y = min(center(b)[1] for b in anchors) if anchors else float('inf')
+            preceding = [center(b)[1] for b in markers if center(b)[1] < target_y]
+            low = max(preceding) if preceding else float('-inf')
+            target = min(anchors,key=lambda b:center(b)[1]) if anchors else None
+            header = _plate_heading_before_heat(card_blocks,target,after=low)
+            if not header:
+                # An unbounded mixed crop cannot safely suppress source text.
+                continue
+            floor = bbox(header)[1]-15
+            if rectangle:
+                rectangle = (rectangle[0],max(rectangle[1],floor),rectangle[2],rectangle[3])
+        for block in card_blocks:
+            if floor is None or center(block) and center(block)[1] >= floor:
+                owned.add((compact(block.get('text')),str(block.get('polygon_page'))))
+        if rectangle:
+            rectangles.append(rectangle)
+    def belongs(block):
+        if (compact(block.get('text')),str(block.get('polygon_page'))) in owned:
+            return True
+        point = _upright_evidence_center(page,block)
+        return bool(point and any(x0<=point[0]<x1 and y0<=point[1]<y1 for x0,y0,x1,y1 in rectangles))
+    return [block for block in blocks if not belongs(block)]
+
+
+def delivery_form_scopes(page, candidate=None):
+    """Locate the selected physical delivery form, using its row coordinates.
+
+    A row number alone is insufficient when two forms restart at row 1. On
+    ambiguous legacy inventories all source forms survive for final review.
+    """
+    all_blocks = delivery_nonplate_blocks(page,
+        page_blocks(page,candidate) if candidate and candidate.get('form_region_id') else page_blocks(page))
+    titles = [b for b in all_blocks if DELIVERY_TITLE.fullmatch(compact(b.get('text'))) and center(b)]
+    titles.sort(key=lambda b:(center(b)[1],center(b)[0]))
+    scopes = []
+    for index,title in enumerate(titles):
+        tx,ty = center(title); th = bbox(title)[3]-bbox(title)[1]
+        low = ty-max(240,th*7)
+        below = [center(t)[1]-max(240,(bbox(t)[3]-bbox(t)[1])*7)
+                 for t in titles if center(t)[1] > ty+th*2]
+        high = min(below) if below else float('inf')
+        same_level = [t for t in titles if t is not title and abs(center(t)[1]-ty) <= th*2]
+        left = max(((center(t)[0]+tx)/2 for t in same_level if center(t)[0]<tx),default=float('-inf'))
+        right = min(((center(t)[0]+tx)/2 for t in same_level if center(t)[0]>tx),default=float('inf'))
+        local = [b for b in all_blocks if center(b) and left <= center(b)[0] < right and low <= center(b)[1] < high]
+        scopes.append(dict(form_id=f"p{page['page_no']:03d}_delivery{index+1}",title=title,
+                           blocks=local,bounds=(left,low,right,high)))
+    if candidate and len(scopes)>1:
+        points = [_upright_evidence_center(page,o.get('value_evidence') or {})
+                  for o in candidate.get('field_observations',[]) if o.get('accepted')]
+        points = [p for p in points if p]
+        selected = [s for s in scopes if any(s['bounds'][0]<=x<s['bounds'][2] and
+                    center(s['title'])[1]<=y<s['bounds'][3] for x,y in points)]
+        if selected:
+            return selected
+        # Some scoped entity inventories omit row polygons; use their OCR
+        # title only when that entity contains exactly one physical title.
+        entity_titles = [b for b in page_blocks(page,candidate)
+                         if DELIVERY_TITLE.fullmatch(compact(b.get('text'))) and center(b)]
+        if len(entity_titles)==1:
+            nearest = min(scopes,key=lambda s:sum((a-b)**2 for a,b in zip(center(s['title']),center(entity_titles[0]))))
+            return [nearest]
+    return scopes
+
+
+def delivery_identity_fields(page, candidate):
+    scopes = delivery_form_scopes(page,candidate)
+    suppliers,numbers,supplier_locations,number_locations = [],[],[],[]
+    supplier_warnings,number_warnings = [],[]
+    for scope in scopes:
+        blocks,title = scope['blocks'],scope['title']
+        values,warnings,locations = company_heading(page,blocks,'delivery_company_heading',role='delivery',title=title)
+        suppliers.extend(values);supplier_warnings.extend(warnings)
+        supplier_locations.extend(locations or [evidence(page,title,'delivery_supplier_heading_missing')])
+        tx,ty = center(title); th = bbox(title)[3]-bbox(title)[1]
+        # No. must be a standalone label in the upper-right title area. Batch
+        # No., telephone numbers and labels inside goods rows are excluded.
+        labels = [b for b in blocks if center(b) and DELIVERY_NUMBER.match(compact(b.get('text')))
+                  and center(b)[0]>=tx and ty-max(120,th*4)<=center(b)[1]<=ty+max(100,th*3)]
+        for label in labels:
+            number_locations.append(evidence(page,label,'delivery_number_label'))
+            raw = DELIVERY_NUMBER.sub('',compact(label.get('text')),count=1)
+            value_blocks = [(label,raw)] if raw else [(b,compact(b.get('text'))) for b in same_line(blocks,label)
+                if b is not label and bbox(b)[0]>=bbox(label)[2]-8 and bbox(b)[0]-bbox(label)[2]<max(120,th*5)][:1]
+            for b,value in value_blocks:
+                if re.fullmatch(r'[A-Za-z0-9]+',value) and any(c.isdigit() for c in value):
+                    item=candidate_value(page,b,value,'delivery_number_after_no')
+                    item['evidence'].append(evidence(page,label,'delivery_number_label'))
+                    numbers.append(item)
+                else:
+                    number_warnings.append('送货单右上No.编号模糊或含非字母数字内容，请核对原图，未自动纠正字符。')
+        if not labels:
+            number_locations.append(evidence(page,title,'delivery_number_upper_right_missing'))
+    if not scopes:
+        fallback=source_locations(page,candidate,page_blocks(page,candidate),'delivery')
+        supplier_locations=number_locations=fallback
+        supplier_warnings.append('送货/发货单标题未可靠定位，供应公司需核对送货页。')
+    if len(scopes)>1:
+        warning='同页多个送货单未唯一定位所选物理行，保留候选供最终核验。'
+        supplier_warnings.append(warning);number_warnings.append(warning)
+    if not numbers:
+        number_warnings.append('送货单右上No.后的字母数字编号未识别，请核对送货页。')
+    supplier=field(suppliers,list(dict.fromkeys(supplier_warnings)))
+    number=field(numbers,list(dict.fromkeys(number_warnings)))
+    for value,locations in ((supplier,supplier_locations),(number,number_locations)):
+        value['review_locations']=locations
+        value['source_form_ids']=[s['form_id'] for s in scopes]
+        if len(scopes)>1:
+            value.update(value='',status='ambiguous')
+    return supplier,number
+
+
 def plate_fields(page, candidate, peers):
     blocks, warnings = plate_scope(page, candidate, peers)
     grade_field, size_field = specification_parts(page, blocks, 'selected_plate')
     grades, sizes = grade_field['candidates'], size_field['candidates']
-    manufacturers = []
-    labelled_manufacturers = []
-    for block in blocks:
-        text = compact(block['text'])
-        for company in COMPANY.findall(text):
-            item = candidate_value(page, block, company, 'selected_plate_company')
-            manufacturers.append(item)
-            if re.search(r'生产(?:厂|单位|企业)|制造商', text):
-                labelled_manufacturers.append(item)
-    if labelled_manufacturers:
-        manufacturers = labelled_manufacturers
+    # The top company inside this card is authoritative. A footer mentioning
+    # another supplier/manufacturer cannot override that physical heading.
+    manufacturers, company_warnings, company_locations = company_heading(
+        page, blocks, 'selected_plate_company_heading', role='nameplate')
     # Only one physical plate permits inventory fallback. Multi-card page fields
     # can contain another card's diameter or its length in metres.
     if len(peers) == 1:
@@ -397,8 +769,10 @@ def plate_fields(page, candidate, peers):
         evs = [evidence(page, anchor, 'selected_plate_heat')] if anchor else [observation_evidence(candidate, o)
             for o in candidate.get('field_observations', []) if o.get('field') == 'heat_lot_no']
         heats.append(dict(value=heat, evidence=evs))
+    producer = field(manufacturers, warnings+company_warnings)
+    producer['review_locations'] = company_locations or source_locations(page, candidate, blocks, 'nameplate')
     return bind_source(dict(specification=specs, grade=grade_field, diameter_mm=size_field,
-                heat_lot_no=field(heats, warnings), manufacturer=field(manufacturers, warnings)), candidate, 'nameplate')
+                heat_lot_no=field(heats, warnings), manufacturer=producer), candidate, 'nameplate')
 
 
 def delivery_table_rows(page):
@@ -511,28 +885,12 @@ def delivery_table_rows(page):
 
 def delivery_fields(page, candidate):
     blocks = page_blocks(page, candidate)
-    all_blocks = page_blocks(page)
-    suppliers = []
-    titles = [b for b in blocks if '送货单' in compact(b['text']) and center(b)]
-    if not titles:
-        global_titles = [b for b in all_blocks if '送货单' in compact(b['text']) and center(b)]
-        if len(global_titles) == 1:
-            titles = global_titles
-    for title in titles:
-        before = [b for b in all_blocks if COMPANY.search(compact(b['text'])) and center(b)
-                  and 0 < center(title)[1]-center(b)[1] < 240]
-        if before:
-            header = min(before, key=lambda b: center(title)[1]-center(b)[1])
-            suppliers.extend(candidate_value(page, header, value, 'delivery_company_heading')
-                             for value in COMPANY.findall(compact(header['text'])))
-    explicit = [candidate_value(page, b, company, 'delivery_explicit_supplier') for b in blocks
-                if re.search(r'供应单位|供货单位|供方', b['text'])
-                for company in COMPANY.findall(compact(b['text']))]
-    if explicit:
-        suppliers = explicit
+    supplier,delivery_no = delivery_identity_fields(page,candidate)
     quantities = []
     grade, diameter = field(), field()
-    table_rows = delivery_table_rows(page)
+    # Physical-resource candidates already carry independently extracted row
+    # observations. Legacy page row ordinals can refer to another form/total.
+    table_rows = [] if candidate.get('form_region_id') else delivery_table_rows(page)
     row_number = re.search(r'row(\d+)$', candidate.get('row_id') or '')
     selected_rows = [r for r in table_rows if r['physical_row_index'] == int(row_number.group(1))] if row_number else (
         table_rows if len(table_rows) == 1 else [])
@@ -552,24 +910,42 @@ def delivery_fields(page, candidate):
     for key, target in [('grade', grade), ('diameter_mm', diameter)]:
         if target['candidates']:
             continue
-        values = []
+        values, unverified = [], []
         for obs in observations:
             if obs.get('field') != key or not obs.get('accepted'):
                 continue
             raw = compact(obs.get('normalized_value'))
-            value = diameter_text(raw) if key == 'diameter_mm' else (raw.upper() if GRADE.fullmatch(raw) else None)
+            # A grade observation is already bound to this physical goods
+            # row and field. Preserve its original OCR wording; matching may
+            # compare its strength digits without requiring a correct prefix.
+            if key == 'diameter_mm':
+                value = diameter_text(raw)
+            else:
+                # A damaged prefix is usable only when its grade column has a
+                # single recognized strength class. Preserve the observation
+                # itself on the physical row, but keep conflicting OCR text
+                # out of the scalar field so the ledger shows review needed.
+                from .matching import grade_number
+                value = raw if (GRADE.fullmatch(raw) or grade_number(raw)) else None
             if value:
                 values.append(dict(value=value, evidence=[observation_evidence(candidate, obs)]))
+            elif key == 'grade' and raw:
+                unverified.append(dict(value=raw, evidence=[observation_evidence(candidate, obs)]))
         target.update(field(values))
+        if unverified:
+            target.update(value='', status='ambiguous', alternatives=unverified,
+                review_locations=[deepcopy(ev) for item in unverified for ev in item['evidence']])
+            target['warnings'].append('送货行牌号数字未唯一识别或存在冲突；保留原OCR文字待最终核验。')
     specs = specification_field(grade, diameter)
     if not candidate.get('row_id') and len(selected_rows) != 1:
         specs['warnings'].append('送货单包含多个货物行且未定位所选行，不能借用其他行规格。')
-    return bind_source(dict(supplier=field(suppliers), grade=grade, diameter_mm=diameter,
+    return bind_source(dict(supplier=supplier, delivery_no=delivery_no, grade=grade, diameter_mm=diameter,
         specification=specs, quantity_t=field(quantities,
         ['送货行未定位，请按所选铭牌对应规格核对送货原图后填写重量（吨）。'] if not candidate.get('row_id') and not quantities else [])), candidate, 'delivery')
 
 
 CERT_ID = re.compile(r'(?<![A-Z0-9])(?:[A-Z]{1,4}[A-Z0-9._/-]{5,}|\d{7,})(?![A-Z0-9])', re.I)
+EXPLICIT_CERT_ID = re.compile(r'(?<![A-Z0-9])(?=[A-Z0-9._/-]*\d)[A-Z0-9][A-Z0-9._/-]{2,}(?![A-Z0-9])', re.I)
 
 
 def certificate_fields(candidate, page=None):
@@ -606,9 +982,15 @@ def certificate_label_values(page, block, blocks):
     values, result = [], []
     text = compact(block.get('text'))
     # Keep the exact OCR token beside an explicit certificate label.
-    label = re.search(r'(?:质量证明书编号|质保书编号|质编号|证明书号|货编号|(?<![A-Z])NO)\s*[:：.]?', text, re.I)
+    label = re.search(r'(?:质量证明书编号|质保书编号|证书编号|质编号|证明书号|货编号|(?<![A-Z])NO)\s*[:：.]?', text, re.I)
     if label:
-        values.extend(CERT_ID.findall(text[label.end():]))
+        # Explicit Chinese labels also carry identifiers such as
+        # ``20251022GX610``. Keep the entire OCR token, including letters in
+        # the middle, without widening the generic No. fallback.
+        identifier = CERT_ID if label.group().upper().startswith('NO') else EXPLICIT_CERT_ID
+        labelled_values = lambda value: [v for v in identifier.findall(value)
+                                         if not re.fullmatch(r'\d+\.\d+', v)]
+        values.extend(labelled_values(text[label.end():]))
         if not values and bbox(block):
             box = bbox(block); yc=(box[1]+box[3])/2; h=max(1,box[3]-box[1])
             neighbours = []
@@ -620,7 +1002,7 @@ def certificate_label_values(page, block, blocks):
                     neighbours.append((obox[0]-box[2], other))
             if neighbours:
                 value_block=min(neighbours,key=lambda x:x[0])[1]
-                for value in CERT_ID.findall(compact(value_block.get('text'))):
+                for value in labelled_values(compact(value_block.get('text'))):
                     result.append((value,value_block,'certificate_label_neighbour'))
     # Some scans merge ``No`` with the value (for example ``NOK...``).
     if re.match(r'^NO', text, re.I):

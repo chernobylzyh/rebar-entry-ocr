@@ -37,12 +37,14 @@ class RebarAdapter(MaterialAdapter):
         manifest = json.loads(page_index.read_text())
         records = inspection / 'records_all_pages.json'
         failures = inspection_failures(manifest)
-        if failures:
-            raise ValueError(f'已找到检验记录页{failures}，但表格定位或提取未通过；请查看逐页诊断和原图')
-        if not json.loads(records.read_text())['records']:
-            if not manifest.get('target_pages'):
-                raise ValueError('未找到检验记录页，请查看逐页分类结果')
-            raise ValueError('已找到检验记录页，但未提取到有效明细；请查看逐页提取结果')
+        extraction_issues = []
+        for page in manifest['pages']:
+            if page['page_no'] not in failures:
+                continue
+            error = page.get('extraction_error')
+            reason = ('进场表提取失败：' + error) if error else '进场表几何定位或字段提取未通过，需核对原页'
+            extraction_issues.append(dict(code='inspection_extraction_failed', page_no=page['page_no'],
+                reason=reason, locations=[dict(page_no=page['page_no'], source_role='inspection', polygon_page=None)]))
         progress('attachments', 0, len(manifest['pages']), '识别附件与重点字段')
         rules = load_rules(rebar_config(self.config['attachment_rules']))
         rules['ocr_runtime'].update(profile=options.ocr_profile,
@@ -87,9 +89,14 @@ class RebarAdapter(MaterialAdapter):
         index=build_index_from_pages(pages,pdf_sha256=manifest['pdf_sha256'],pdf_name=pdf.name,rules=rules)
         index['runtime_execution']=dict(isolated_stages=True,shard_pages=5,stage_runs=stage_runs)
         write_json(attachment_dir/'attachment_index.json',index)
+        from .quantity_list import extract_quantity_lists
+        saved = json.loads(records.read_text())
+        saved['records'].extend(extract_quantity_lists(index,
+            excluded_pages={r['page_no'] for r in saved['records']}))
+        saved['extraction_issues'] = extraction_issues + [dict(code='attachment_ocr_failed',
+            page_no=p['page_no'], reason='附件OCR执行失败') for p in index['pages'] if p.get('ocr_status') == 'failed']
+        write_json(records, saved)
         failures = [p['page_no'] for p in index['pages'] if p.get('ocr_status') == 'failed']
-        if failures:
-            raise ValueError(f'附件页{failures}识别失败，已保存日志和其余页面，不当作完整匹配')
         return ExtractedDocuments(records, output / 'attachments/attachment_index.json', page_index)
 
     @staticmethod

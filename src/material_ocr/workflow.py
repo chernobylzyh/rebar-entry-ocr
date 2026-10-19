@@ -48,6 +48,8 @@ def run_pipeline(pdf, output, material_id='rebar', options=None, *, progress=Non
     """Supports genuine OCR or explicit saved-evidence replay; never confuses the two."""
     pdf, output = Path(pdf).resolve(), Path(output).resolve()
     options = options or RuntimeOptions()
+    if options.artifact_policy not in ('compact', 'full'):
+        raise ValueError('artifact_policy须为compact或full')
     adapter = (registry or MaterialRegistry()).get(material_id)
     if options.inspection_layout not in adapter.info.layouts:
         raise ValueError('该材料不支持此检验表版式：' + options.inspection_layout)
@@ -107,9 +109,12 @@ def run_pipeline(pdf, output, material_id='rebar', options=None, *, progress=Non
                    pdf_sha256=digest(pdf), metrics=result['metrics'], statistics=statistics,
                    review='review/index.html', new_ocr_executed=replay_documents is None,
                    write_allowed=False))
+        from material_ocr.storage_artifacts import compact_artifacts
+        report('archiving', 0, 1, '整理可再生诊断图片，保存OCR证据与台账')
+        storage = compact_artifacts(output, policy=options.artifact_policy)
         meta.update(status='completed', end_time_utc=utc_now(), exit_code=0,
                     artifacts=dict(summary='summary.json', review='review/index.html', statistics='statistics.json'),
-                    metrics=result['metrics'])
+                    metrics=result['metrics'], storage=storage)
         report('completed', 1, 1, '匹配完成，可打开审核结果')
         return result
     except BaseException as exc:

@@ -1,148 +1,90 @@
-# 材料表单 OCR 工作台
+# 报审表 OCR 台账提取
 
-在本地网页上传 PDF 或文件夹，完成表单分类、OCR、四表匹配、原图人工审核和材料台账导出。当前钢筋流程已跑通；钢梁、混凝土提供材料接口与配置示例，接入真实样本并验证后启用。
+这是一个本地运行的报审表 OCR 与钢筋台账工作台：上传 PDF 后，由 Python 完成页面分类、进场表字段提取、附件 OCR 和四表自动匹配；Java 保存业务状态、人工补正、核验和 Excel 导出；Vue 提供上传、历史、单卷台账、总台账和原图定位界面。
 
-**主流程：上传 PDF → 检验记录与附件 OCR → 分类/字段目录 → 四表匹配与捆绑审核 → 捆绑 CSV / 审核 JSON；已捆绑物料 → 台账字段核验 → 台账 XLSX。**
+当前默认 OCR 模型是 `local-glm`，也可在界面切换到 `local-paddle`。模型权重、PDF、OCR 结果和业务数据库均由运行环境本地生成，不随仓库提交。
 
-[完整流程](docs/WORKFLOW.md) · [网页操作](docs/WEB_USAGE.md) · [代码地图](docs/CODE_MAP.md) · [GitHub 提交说明](docs/GITHUB_SUBMISSION.md)
+## 已实现功能
 
-新增固定版式报审表四字段提取及重复候选，接入现有网页台账，详见 [报审表更新说明](docs/SUBMISSION_UPDATE.md)。第一阶段汇总新增 submission_forms / submission_duplicate_candidates；原进场表记录接口保持 records。
+- 自适应进场数量清单/进场检验记录提取，保留物理行、字段坐标、单位和置信度依据。
+- 工程材料报审表公共字段提取，支持日期、使用部位、材料名称和文件编号证据。
+- 质量证明书、铭牌、送货单的分类、逐卡/逐行读字和证据保存。
+- 两条四表关联路径：清单质保书编号优先，或按规格/牌号寻找铭牌和送货单；规格严格匹配，牌号按有效强度数字匹配。
+- 同页送货单补全、多个铭牌逐卡登记、证书/铭牌冲突保留双方原文和定位。
+- 重复证号合并、全占位模板行过滤、缺失/未匹配/多候选/冲突诊断和字段核验策略。
+- 12 列最终台账、字段来源和原图定位；Java 侧人工补正、核验后导出 Excel/CSV。
+- 异步识别队列、同卷任务复用、模型目录和切换保护；诊断图片按 compact 策略按需恢复。
 
-新增可选的 **自适应进场表提取**：网页选择「自适应表格模型（钢筋）」，或命令行增加 `--layout adaptive`。复用原页面分类与报审首页流程，以单元格检测和 OCR 坐标配对替代固定进场表模板。原 `auto/6_rows/11_rows` 模式保持不变。运行方法、模型依赖和边界见 [自适应更新说明](docs/ADAPTIVE_TABLES.md)。
+主要规则见 [自动台账说明](docs/AUTOMATIC_LEDGER.md)，模型维护见 [OCR 模型说明](docs/OCR_MODELS.md)。
 
-## 安装和启动
+## 环境准备
 
-在仓库根目录，使用现有 `ocr` conda 环境：
+需要 Python 3.10+、JDK 17+、Maven 和 Node.js 20.19+。Python 依赖在 `pyproject.toml`/`requirements.txt`，包括 PaddleOCR/PaddleX、pypdfium2、FastAPI 和 XlsxWriter。Paddle 计算后端按硬件单独安装；当前生产管线使用 Linux/WSL 的 `fcntl` 文件锁。GLM 推理依赖另装在 `.venv-glm/`，权重单独放在 `models/GLM-OCR/`；具体新环境安装步骤见 [GLM 环境准备](docs/GLM_OCR.md#模型与环境)。`pip install -e .` 不会安装 PyTorch/Transformers 或下载 GLM 权重。
 
 ```bash
-conda activate ocr
 python -m pip install -e .
-python -m material_ocr serve --port 8080 --data-dir runs/web \
-  --model-cache models/paddlex_cache --review-library runs
+npm --prefix 前端/vue ci
 ```
 
-安装命令在首次使用或依赖变化时执行。看到 `Uvicorn running on http://127.0.0.1:8080` 后，保持终端运行，浏览器打开 **[http://localhost:8080](http://localhost:8080)**；按 `Ctrl+C` 停止。Chrome / Edge 支持目录及子目录 PDF 选择。
+已有 `ocr` conda 环境可以直接复用。首次安装可能需要联网下载 Python、Maven 和 npm 依赖；模型权重由各运行环境自行准备。
 
-开发环境参考：Python 3.10、PaddleOCR 3.3.2、PaddleX 3.3.13、GPU Paddle 3.4.0 / CUDA 12.9、RTX 5070 Ti；项目依赖见 [pyproject.toml](pyproject.toml)。项目安装不替换已有 Paddle 计算后端。
+## 启动
 
-全新机器需另装适配硬件的 Paddle 后端。当前 Linux / RTX 5070 Ti 环境已使用以下 GPU 安装命令；其他 CUDA 环境按 Paddle 官方兼容版本安装：
+在仓库根目录打开三个终端。Python 端口固定使用 8000，Java 使用 8080，Vue 默认使用 5173。
 
 ```bash
-python -m pip install paddlepaddle-gpu==3.4.0 \
-  --index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/ \
-  --extra-index-url https://pypi.org/simple
+# 终端 1：Python OCR/匹配服务
+PYTHONPATH=src:. python -m material_ocr serve \
+  --port 8000 --data-dir runs/web --model-cache models/paddlex_cache
 ```
 
-CPU 环境安装 `paddlepaddle`，启动时加 `--device cpu --profile complete`。首次使用没有本地缓存的模型时需要下载，权重不随仓库分发。
-
-## 网页使用
-
-1. 选择「钢筋」与「自动选择支持的版式」，选择 PDF / 文件夹，点击「开始识别与匹配」。
-2. 等待任务完成，点击「查看匹配与审核」；分类、逐格提取失败时查看「检验记录原图」和「运行日志」。
-3. 唯一且无待核验项的四表自动捆绑。其余在「待补全 / 待复核」中核对质证书、铭牌、送货单候选和原图，点击「人工确认并捆绑四表」。
-4. 下载审核 JSON 备份或四表捆绑 CSV；已用铭牌、送货行退出剩余候选，允许解除捆绑重新选择。
-5. 在「自动填表 · 材料报审台账」选择报审信息来源，核对 / 补正字段，点击「确认本行字段」，再「导出已确认行 Excel」。
-
-匹配确认与台账字段确认分别保存。改选表单或提取版本变化后，旧字段确认失效。钢筋台账以一个独立铭牌为一行：报审表提供材料名称、使用部位、供货日期和可空文件编号；规格品种优先组合铭牌牌号与直径，缺失时用关联送货物理行规格补充；铭牌提供炉批号和生产单位；送货单提供供应单位；验收数量优先取检验记录进场数量，缺失时暂用送货行重量并提示复核；质证书提供质保书编号。重复检验记录不累加，数量差异保留对照来源。
-
-|导出|用途|
-|---|---|
-|审核 JSON|保存当前关联、人工记录、字段审核与剩余候选，可导入恢复|
-|四表捆绑 CSV|当前已捆绑关联的页码、编号观察、送货行与原进场量|
-|材料台账 XLSX|仅导出字段已确认行，含「材料台账」「字段溯源」|
-|磁盘 `match_results.csv`|生成时的自动候选快照，人工确认不会回写|
-
-完整十列台账当前导出为 XLSX；需要台账 CSV 时可将「材料台账」工作表另存为 UTF-8 CSV。当前没有独立台账 CSV 按钮。
-
-## 已实现能力与边界
-
-|能力|当前状态|
-|---|---|
-|PDF 多选、目录、拖放、任务进度与结果查看|已实现；每批最多 100 份、单份 256 MB、整批 1 GB；每 PDF 独立匹配，GPU 任务串行|
-|钢筋检验表|六行 / 十一行自动几何选择，有限列宽漂移适配，失败诊断保留|
-|附件 OCR 与分类|全页方向校验、同页铭牌 / 送货实体拆分、字段原文 / 坐标证据|
-|四表关系|优先质证编号 → 质证书炉批号 → 铭牌；铭牌 / 送货单双向同页补全|
-|多路径与字段冲突|进场数量对送货行重量消歧；重量不清晰时同行规格辅助；清晰矛盾继续复核|
-|缺失单候选和人工审核|包含未提取编号 / 炉号的分类页，逐组捆绑更新库存；编号差异保留复核|
-|审核后台账|钢筋十列字段、必填校验、补正确认、Excel 与字段溯源|
-|其他材料|材料提取 / 匹配 / 统计 / 填表接口已建，钢梁 / 混凝土真实能力待接入|
-
-默认 `gpu:0` 与 `batched_gpu`；附件识别 batch 32，每五页独立进程、逐页检查点，OOM 时 batch 6 重试未完成页。服务重启保留成功结果并将未完成任务记为中断，当前不支持跨服务自动续跑。严重遮挡、任意新版式与自定义 Excel 模板仍需扩展和人工验证。
-
-材料统计注明单位与重复来源，原始记录累计不能直接视为去重进场总量。候选齐全不等于识别准确率。
-
-## 工程结构
-
-```text
-src/material_ocr/
-  cli.py / workflow.py    公开入口、通用流程与运行记录
-  worker.py / processes.py 独立识别阶段、进程清理
-  web/                    上传工作台、FastAPI、任务队列与缓存
-  materials/              材料接口、注册、钢筋业务规则与配置
-  extraction/             检验表定位、单元格与逐页提取
-  ocr/                    附件 OCR、方向、实体 / 物理行与证据
-  matching/               字段目录复用与历史关系研发工具
-  review/                 四表捆绑、候选清单、原图审核与浏览器状态
-  filling/                台账校验、Excel 和溯源导出
-docs/                     使用、流程、架构、代码地图与接收方核验说明
-```
-
-本仓库只交付运行代码、包内规则/模板/网页资源、安装配置和当前说明。实验方案与结果、研发工具、测试、历史文档、模型清单、业务扫描件和已有 OCR / 审核 / 导出结果留在开发者本地，不提交。接收方首次运行会创建自己的模型缓存和任务目录。钢筋算法与配置位于 `materials/rebar/`，随运行代码交付。
-
-逐文件职责与修改位置见 [代码地图](docs/CODE_MAP.md)。新增材料实现 `MaterialAdapter.extract()/match()/statistics()`，需要台账时提供 `form_writer()`；注册后网页读取材料及版式选项，业务规则在材料目录独立定义，见 [材料接入](docs/MATERIALS.md)。
-
-## 命令行与接收方核验
+CPU 环境可增加 `--device cpu --profile complete`；默认使用 `gpu:0` 和 compact 产物策略。模型切换、缓存命名空间和活动任务保护由服务统一管理。
 
 ```bash
-# 完整 OCR；输出目录必须尚不存在
-python -m material_ocr analyze --pdf data/input.pdf --out runs/new_analysis --material rebar
+# 终端 2：Java 业务服务（本地 H2，无需 MySQL）
+OCR_BASE_URL=http://127.0.0.1:8000 bash 前端/bin/start-local.sh
+```
 
-# 复用同 PDF 的已保存记录和完整 OCR 索引，只重新匹配
-python -m material_ocr replay --pdf data/input.pdf \
-  --records runs/source/work/inspection/records_all_pages.json \
+```bash
+# 终端 3：Vue 开发服务
+cd 前端/vue
+npm run dev
+```
+
+浏览器打开 Vue 终端输出的地址，通常为 `http://127.0.0.1:5173`。Java 本地数据写入 `前端/runtime/h2/`，文件写入 `前端/image/`；这些目录均为本地产物。
+
+停止各终端服务使用 `Ctrl+C`。已有环境启动前先检查实际进程与活动任务，避免重复启动占用端口。
+
+生产构建：
+
+```bash
+npm --prefix 前端/vue run build
+cd 前端/java/business && mvn package
+```
+
+## 常用命令与接口
+
+```bash
+# 历史 Paddle 命令行流程（与 Vue 默认 GLM 入口区分）；输出目录必须是新目录
+PYTHONPATH=src:. python -m material_ocr analyze \
+  --pdf data/input.pdf --out runs/new_analysis --material rebar
+
+# 复用已保存 OCR，只重放匹配
+PYTHONPATH=src:. python -m material_ocr replay \
+  --pdf data/input.pdf --records runs/source/work/inspection/records_all_pages.json \
   --index runs/source/work/attachments/attachment_index.json \
   --out runs/new_replay --material rebar
 
-python -m material_ocr materials
-python -m material_ocr --help
+# 只检查分类和进场表提取，不执行附件 OCR/四表匹配
+PYTHONPATH=src:. python -m material_ocr.worker inspection \
+  --pdf data/input.pdf --out runs/inspection_only --device gpu:0 \
+  --model-cache models/paddlex_cache --layout adaptive
 ```
 
-网页产物位于 `runs/web/job-*/documents/file-*/`；审核页位于 `review/index.html`。保存分类、原记录、OCR 索引、候选库存、日志、配置与源码快照。`--review-library runs` 可发现已有审核结果，并将任务入口链接到同 PDF 的最新回放；修改规则或审核模板后，使用 `replay` 生成新结果并重启服务。
+网页主入口使用 Vue hash 路由：`/#/upload`、`/#/history`、`/#/history/<pdf_name>`、`/#/library/master`。Python 端提供 `/api/library/<id>/recognition`、`/api/library/<id>/ledger` 等接口，Java 端负责向 Vue 转发并保存业务副本。重新识别前请确认没有未导出的人工补正或正在运行的同卷任务。
 
-接收方按 [运行与核验说明](docs/ACCEPTANCE.md) 在自己的环境安装后端、上传自己的 PDF，检查分类、四表关联、候选库存、台账字段与导出。既有样本结果不随代码交付，具体运行和核验结论由接收方保存。
+## 交付边界
 
-## 文档与交接
+仓库只同步运行源码、配置、依赖锁文件、前端/Java 必需资源和说明文档。`tools/__init__.py` 和 `tools/compare_ocr_ledgers.py` 是生产匹配器的直接依赖，一并交付；其他研发工具不交付。以下内容必须留在本地：业务 PDF、`runs/` OCR/台账缓存、`models/` 模型权重、`前端/image/library/`、`前端/runtime/`、日志、构建目录、实验记录和浏览器缓存。新合作者应使用自己的 PDF 和缓存重新运行，并把验证结果记录在本地 `experiments/`。
 
-### 只测试上游分类和进场表提取
-
-不需要附件 OCR、四表匹配时，直接运行现有的 inspection 阶段（输出目录须为新目录）：
-
-```bash
-python -m material_ocr.worker inspection --pdf data/input.pdf --out runs/inspection_only --device gpu:0 --model-cache models/paddlex_cache --layout adaptive
-```
-
-该命令逐页分类、提取报审表，并对目标进场表校准后使用表格模型和 OCR 配对，**不会调用附件识别或下游匹配**。
-`page_index.json` 查看页码与分类证据，`records_all_pages.json` 的 `records` 数组是进场产品数据；报审表另存 `submission_forms.json`。
-
-本次三份样本的 AutoDL 复测可使用 `python autodl_test_three.py --data-dir /path/to/pdf_folder`。
-目录中需有 `0814钢筋01.pdf`、`0814钢筋02.pdf`、`2025.12.6日钢筋报审表.pdf`。
-脚本串行运行上游阶段，默认复用 `/root/.paddlex` 缓存，创建新的时间戳输出目录，记录每份耗时并生成 `results_for_review.zip`（JSON 和日志，不含扫描图片）。不会覆盖旧结果。安装本项目后使用；`--dry-run` 仅检查输入并展示命令。
-
-- 自适应模式同时支持明确的“进场检验记录”和“进场数量清单”标题，并要求序号、规格、数量和材料/厂家表头证据。不是任意标题命中即放行。
-- 保留原有 `row_no/material_name/manufacturer/diameter_mm/weight_t/certificate_no` 字段和坐标证据。规格支持 `HRB400E Φ10`，另存 `grade`；数量可从 `进场数量(t)` 表头继承单位，保留单位表头证据，不默认猜吨。
-- 数量清单确无证书号列时，`certificate_no=null`、`certificate_no_source_status=not_in_source`，不阻止其他字段输出；另提取存在的 `entry_date/use_location/self_check_result`。有证书列却读不出内容、表头不明、单位冲突仍保留复核标记。
-- 数量清单采用有限的分字段置信度规则（`materials/rebar/config/entry_confidence.json`）：通用阈值仍为 0.95；仅对含明确单位的数量表头、能完整解析出牌号和正直径的规格，允许 0.90。还必须满足单个 OCR 文本框、归属唯一、覆盖率不低于 0.98、候选覆盖率差不低于 0.50。重量数值、编号、厂家等不放宽；低于 0.90、单位冲突、缺失、结构或校准不确定仍复核。只改变是否触发告警，不修改原文或原始分数，依据分别保存在字段的 `header_confidence_decision` / `confidence_decision`。这不是准确率保证；通过后状态与旧样本正常记录一致为 `rule_pass_review_required`，仍不是人工确认。
-- B.0.6 报审表优先沿用原有连续填写线定位；失败时，在校准后的表框内尝试合并短小、近似共线的断线，并要求日期、使用部位、材料名称三个区域均能唯一定位。兼容日期填写区偏左、使用部位多行的版式；缺线或多个候选仍报定位失败，不用固定位置硬猜。编号仅有前缀时保留原文并标注复核，不补造编号。
-- `ready_for_search=false` 和草稿复核状态继续保留，不代表 OCR 已经人工确认。新增类型请使用 `--layout adaptive`；旧固定坐标模板没有扩展。
-- 本更新不扩展无证书号情况下的下游关联；网页完整流程依然包含附件和匹配，不适合作为“只测上游”的入口。
-
-|文档|用途|
-|---|---|
-|[完整流程](docs/WORKFLOW.md)|各阶段输入 / 输出、匹配规则、两步审核和导出|
-|[网页使用](docs/WEB_USAGE.md)|启动、打开结果、操作与常见问题|
-|[代码地图](docs/CODE_MAP.md)、[架构](docs/ARCHITECTURE.md)|目录、函数入口与维护职责|
-|[材料扩展](docs/MATERIALS.md)|钢梁、混凝土及其他材料接入接口|
-|[GitHub 提交](docs/GITHUB_SUBMISSION.md)|提交范围、忽略本地数据、暂存 / commit / push 命令|
-|[当前交接](docs/HANDOFF.md)、[接收方核验](docs/ACCEPTANCE.md)|交付内容、运行前提与核验步骤|
-
-浏览器审核缓存按协议、域名和端口隔离；下载审核 JSON 后可在同 PDF 页面导入恢复。运行时会自动在本地任务目录保存输入哈希、配置、日志与运行状态，不依赖开发者的实验目录。
+进一步维护入口：`TASK_HANDOFF.md`、[网页使用](docs/WEB_USAGE.md)、[完整流程](docs/WORKFLOW.md)、[架构](docs/ARCHITECTURE.md)、[代码地图](docs/CODE_MAP.md)。
