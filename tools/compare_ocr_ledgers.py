@@ -757,8 +757,41 @@ def _unique_preceding_attachment_plate(plate, plates, deliveries, certificates):
     return len(page_plates) == 1 and len([d for d in deliveries if d.get('page_no') == plate['page_no']]) == 1
 
 
+def _certificate_heat_specification(certificate, heat):
+    """Read a complete specification from this heat's local OCR observations.
+
+    A global certificate heading or an inspection row cannot supply a missing
+    keyword. Duplicate page/crop observations are allowed; contradictory local
+    readings make the specification unusable for the numeric-typo fallback.
+    """
+    observations = [o for o in certificate.get('heat_observations', [])
+                    if token(o.get('value')) == token(heat)]
+    grades, diameters, complete, locations = [], [], False, []
+    for observation in observations:
+        raw = unicodedata.normalize('NFKC', observation.get('raw_text') or '')
+        grade = observation.get('grade_literal', '')
+        strength = grade_number(grade)
+        sizes = re.findall(r'[ΦφФØ⌀]\s*(\d+(?:\.\d+)?)', raw)
+        literal = unicodedata.normalize('NFKC', str(observation.get('diameter_literal') or ''))
+        sizes.extend(re.findall(r'[ΦφФØ⌀]\s*(\d+(?:\.\d+)?)', literal))
+        if re.fullmatch(r'\d+(?:\.\d+)?', literal):
+            sizes.append(literal)
+        sizes = unique(format(Decimal(size).normalize(), 'f') for size in sizes)
+        if strength:
+            grades.append((grade, strength))
+        diameters.extend(sizes)
+        if strength and len(sizes) == 1 and observation.get('evidence'):
+            complete = True
+        locations.extend(evidences(observation.get('evidence')))
+    strengths, sizes = unique(g[1] for g in grades), unique(diameters)
+    if not complete or len(strengths) != 1 or len(sizes) != 1:
+        return None
+    return dict(grade_literal=grades[0][0], grade_numeric_key=strengths[0],
+                diameter_mm=sizes[0], observations=deepcopy(observations), evidence=locations)
+
+
 def _heat_review_candidates(certificates, plates, *, grade='', diameter=''):
-    """Return one-letter heat-lot conflicts with evidence for safe association.
+    """Return letter conflicts, or numeric conflicts with equal local specs.
 
     The caller promotes a conflict only when one unique certificate and one
     unique nameplate each have one heat, and no exact-heat nameplate was
@@ -767,25 +800,58 @@ def _heat_review_candidates(certificates, plates, *, grade='', diameter=''):
     result = []
     if len(certificates) != 1:
         return result
+    # Reuse the existing one-to-one geometric reconciliation of crop and
+    # text-segment views. Keep the measured card as the locator; a supplement
+    # is allowed to supply its own heading only when both views have equal
+    # heat, grade and diameter. Other physical cards stay separate candidates.
+    measured = {p.get('candidate_id'): p for p in plates if not _plate_boundary_unverified(p)}
+    plate_views = []
+    for view in _single_heat_certificate_plate_views(plates):
+        if view.get('certificate_view_resolution') == 'same_page_single_heat_segment_and_measured_roi':
+            anchors = [measured[key] for key in view['source_candidate_ids'] if key in measured]
+            if len(anchors) == 1:
+                view = deepcopy(view)
+                anchor = anchors[0]
+                view.update(candidate_id=anchor['candidate_id'], scope=anchor.get('scope'),
+                    evidence=deepcopy(anchor['evidence']),
+                    issues=[i for i in view.get('issues', [])
+                        if i != 'physical_card_boundary_not_verified'])
+        plate_views.append(view)
     for certificate in certificates:
         if len(unique(certificate.get('certificate_numbers', []))) != 1:
             continue
         for certificate_heat in unique(certificate.get('heat_lots', [])):
-            for plate in plates:
+            certificate_spec = _certificate_heat_specification(certificate, certificate_heat)
+            for plate in plate_views:
                 if _plate_boundary_unverified(plate) or plate.get('spatial_unresolved'):
                     continue
                 if not _certificate_grade_compatible(grade, plate.get('grade')):
                     continue
-                if not diameter or not plate.get('diameter_mm') or not same_number(plate['diameter_mm'], diameter):
+                if (diameter and plate.get('diameter_mm') and
+                        not same_number(plate['diameter_mm'], diameter)):
                     continue
+                equal_spec = bool(certificate_spec and plate.get('grade') and plate.get('diameter_mm') and
+                    grade_number(plate['grade']) == certificate_spec['grade_numeric_key'] and
+                    same_number(plate['diameter_mm'], certificate_spec['diameter_mm']))
                 for nameplate_heat in unique(plate.get('heat_lots', [])):
-                    difference = single_heat_difference(certificate_heat, nameplate_heat)
+                    difference = single_heat_difference(certificate_heat, nameplate_heat,
+                                                        allow_numeric=equal_spec)
                     if not difference:
                         continue
+                    if (difference['difference_type'] == 'letter' and
+                            (not diameter or not plate.get('diameter_mm'))):
+                        continue
+                    numeric = difference['difference_type'] == 'digit'
                     certificate_evidence = evidences(certificate.get('evidence')) or [
                         dict(page_no=certificate['page_no'], source_role='certificate', precision='page')]
+                    if numeric:
+                        certificate_evidence.extend(certificate_spec['evidence'])
                     plate_evidence = evidences(plate.get('evidence')) or [
                         dict(page_no=plate['page_no'], source_role='nameplate', precision='page')]
+                    for view_evidence in plate.get('evidence_views', []):
+                        for item in evidences(view_evidence):
+                            if item not in plate_evidence:
+                                plate_evidence.append(item)
                     for item in certificate_evidence:
                         item.setdefault('page_no', certificate['page_no'])
                         item['source_role'] = 'certificate'
@@ -798,9 +864,13 @@ def _heat_review_candidates(certificates, plates, *, grade='', diameter=''):
                         certificate_heat_lot=certificate_heat,
                         nameplate_heat_lot=nameplate_heat,
                         heat_difference=difference,
+                        specification_match=deepcopy(certificate_spec) if equal_spec else None,
                         reason=(f'质量证明书第{certificate["page_no"]}页炉批号「{certificate_heat}」与'
-                            f'铭牌第{plate["page_no"]}页炉批号「{nameplate_heat}」仅有一个字母差异：'
-                            f'{difference["description"]}；疑似OCR误读，保留双方原文待人工核验'),
+                            f'铭牌第{plate["page_no"]}页炉批号「{nameplate_heat}」仅有一个'
+                            f'{"数字" if numeric else "字母"}差异：{difference["description"]}'
+                            + (f'；证书该炉批行与铭牌规格一致（牌号强度{certificate_spec["grade_numeric_key"]}、'
+                               f'直径{certificate_spec["diameter_mm"]}）' if numeric else '') +
+                            '；疑似OCR误读，保留双方原文待人工核验'),
                         locations=certificate_evidence + plate_evidence,
                         review_only=True, write_allowed=False))
     unique_result = []
@@ -811,6 +881,50 @@ def _heat_review_candidates(certificates, plates, *, grade='', diameter=''):
         if key not in seen:
             seen.add(key); unique_result.append(item)
     return unique_result
+
+
+def _select_heat_review(candidates, deliveries):
+    if len(candidates) == 1:
+        return candidates[0]
+    # Independent copies of the same heat/spec can have different deliveries.
+    # Use an attachment group only when all candidates agree on the heat and
+    # exactly one lies immediately before the certificate with one delivery.
+    if not candidates or not all(c.get('specification_match') for c in candidates):
+        return None
+    if len(unique(c['nameplate_heat_lot'] for c in candidates)) != 1:
+        return None
+    adjacent = [c for c in candidates
+        if c['nameplate']['page_no'] == c['certificate']['page_no'] - 1 and
+        sum(d['page_no'] == c['nameplate']['page_no'] for d in deliveries) == 1]
+    return adjacent[0] if len(adjacent) == 1 else None
+
+
+def _certificate_nameplate_links(certificates, plates, deliveries):
+    """Preserve attachment matches even when an entry certificate No. is bad.
+
+    These links confirm the certificate/heat/spec relationship only. They do
+    not authorize any inspection-row fields until its certificate is located.
+    """
+    links = []
+    for certificate in certificates:
+        if len(unique(certificate.get('heat_lots', []))) != 1:
+            continue
+        if any(set(certificate['heat_lots']).intersection(p.get('heat_lots', [])) for p in plates):
+            continue
+        candidates = _heat_review_candidates([certificate], plates)
+        if not candidates:
+            continue
+        selected = _select_heat_review(candidates, deliveries)
+        heat = selected['nameplate_heat_lot'] if selected else ''
+        reason = (selected['reason'] + '；已关联证书与铭牌，最终炉批号采用铭牌原文'
+                  if selected else '同炉批规格存在多个铭牌候选，保留待核验')
+        links.append(dict(certificate=deepcopy(certificate), nameplate_candidates=candidates,
+            nameplate=deepcopy(selected['nameplate']) if selected else None,
+            written_heat=heat, associated=bool(selected), needs_review=True,
+            status='associated_with_heat_conflict' if selected else 'ambiguous', reason=reason,
+            locations=deepcopy(selected['locations']) if selected else
+                [e for c in candidates for e in c['locations']]))
+    return links
 
 
 def build_glm_ledger(resources, checkpoints=()):
@@ -824,6 +938,7 @@ def build_glm_ledger(resources, checkpoints=()):
     # only creates an in-memory copy and never rewrites that cache.
     resources, dedup_diagnostics, dedup_summary = deduplicate_certificate_records(resources)
     plates, deliveries, certificates = (resources.get(k, []) for k in ('nameplates', 'deliveries', 'certificates'))
+    certificate_nameplate_links = _certificate_nameplate_links(certificates, plates, deliveries)
     occupied_delivery_pages = {delivery['page_no'] for delivery in deliveries
         if any(plate['page_no'] == delivery['page_no'] for plate in plates)}
     contexts = checkpoint_context(checkpoints)
@@ -953,8 +1068,8 @@ def build_glm_ledger(resources, checkpoints=()):
             grade=grade, diameter=diameter)
             if certificate_key and not plate else [])
         associated_heat_conflict = None
-        if not plate and not heat_plates and len(heat_review_candidates) == 1:
-            selected_review = heat_review_candidates[0]
+        selected_review = _select_heat_review(heat_review_candidates, deliveries) if not plate else None
+        if not plate and not heat_plates and selected_review is not None:
             if (len(unique(selected_review['certificate'].get('heat_lots', []))) == 1 and
                     len(unique(selected_review['nameplate'].get('heat_lots', []))) == 1):
                 plate = selected_review['nameplate']
@@ -963,7 +1078,8 @@ def build_glm_ledger(resources, checkpoints=()):
                     needs_review=True, status='associated_with_conflict')
                 selected_review['heat_difference'] = dict(selected_review['heat_difference'],
                     review_only=False, write_allowed=True)
-                selected_review['reason'] += '；唯一单字母差异铭牌已自动关联，台账采用铭牌炉批号并标注为矛盾，待人工核验'
+                selected_review['reason'] += ('；唯一近似炉批且证书炉批行规格一致，已自动关联，'
+                    '台账采用铭牌炉批号并标注为矛盾，待人工核验')
                 issues = [reason for reason in issues if reason != '没有通过全部约束的铭牌']
         if heat_review_candidates:
             issues.extend(item['reason'] for item in heat_review_candidates)
@@ -1221,7 +1337,7 @@ def build_glm_ledger(resources, checkpoints=()):
                             f'已按清单编号找到质量证明书：{certificate_readings}{quality}；停在“证书→炉批号”，未取得可用的证书炉批号')
                     elif not heat_plates:
                         detail = ('本卷尚未解析出有效铭牌标签组，需检查混合页面/铭牌解析'
-                            if not plates else '已解析铭牌中没有相同炉批号，单字母差异候选也未唯一通过约束')
+                            if not plates else '已解析铭牌中没有相同炉批号，近似炉批号候选也未唯一通过约束')
                         chain_reasons.append(
                             f'已按清单编号找到质量证明书并读出炉批号：{certificate_readings}；停在“炉批号→铭牌”，{detail}')
                     else:
@@ -1319,7 +1435,9 @@ def build_glm_ledger(resources, checkpoints=()):
             plate.get('heat_lots', []))) if plate and selected_certificate else []
         if plate:
             sources['nameplate'].update(association_method=(
-                'certificate_heat_lot_letter_conflict' if associated_heat_conflict else
+                ('certificate_heat_lot_digit_conflict_equal_specification'
+                 if associated_heat_conflict['heat_difference']['difference_type'] == 'digit'
+                 else 'certificate_heat_lot_letter_conflict') if associated_heat_conflict else
                 'certificate_heat_lot' if certificate_key else 'entry_grade_and_diameter'),
                 matched_heat_lots=matched_heat_lots)
             if associated_heat_conflict:
@@ -1357,6 +1475,11 @@ def build_glm_ledger(resources, checkpoints=()):
                         certificate_field['evidence'].append(deepcopy(location_item))
             certificate_field['status'] = 'needs_review'
             issues.extend(issue.get('reason', '重复质保书编号已合并') for issue in dedup_issues)
+        unconfirmed_links = [deepcopy(link) for link in certificate_nameplate_links
+            if any(c['page'] == link['certificate']['page_no'] for c in certificate_review_candidates)]
+        for link in unconfirmed_links:
+            link.update(kind='unconfirmed_certificate_nameplate_match', review_only=True, write_allowed=False)
+            link['reason'] += '；清单证号尚未确认，整条清单关联仍待核验，未写入台账字段'
         rows.append(dict(record_id=record['record_id'], page_no=page, row_no=record['row_no'], fields=fields,
             entry_specification=entry_specification,
             match_route=route, match_path=match_path, matched_heat_lots=matched_heat_lots,
@@ -1368,9 +1491,10 @@ def build_glm_ledger(resources, checkpoints=()):
                 certificate_pages=unique([c['page_no'] for c in certificate_candidates or certs_by_heat] +
                     [c['page'] for c in certificate_review_candidates]),
                 review_only_certificates=certificate_review_candidates,
+                unconfirmed_certificate_nameplate_links=unconfirmed_links,
                 certificate_number_conflicts=punctuation_certificate_reviews,
                 heat_lot_conflicts=heat_review_candidates)))
-    return dict(records=rows, nameplate_links=links,
+    return dict(records=rows, nameplate_links=links, certificate_nameplate_links=certificate_nameplate_links,
                 nameplates=[_plate_summary(p) for p in plates], deliveries=[_delivery_summary(d) for d in deliveries],
                 certificates=[dict(page_no=c['page_no'], certificate_numbers=c.get('certificate_numbers', []),
                     heat_lots=c.get('heat_lots', []), issues=c.get('issues', []), evidence=evidences(c.get('evidence')))
