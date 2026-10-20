@@ -16,6 +16,7 @@ _GROUP_LABELS = {
     "review_only_certificates": "质量证明书编号候选",
     "certificate_number_conflicts": "质保书编号冲突候选",
     "heat_lot_conflicts": "炉批号冲突候选",
+    "unconfirmed_certificate_nameplate_links": "证书与铭牌关联（清单证号待核验）",
 }
 
 

@@ -357,18 +357,69 @@ def certificate_conflict_query(record, certificate, page):
     return next(iter(grades)), diameter or cert_diameter, [ev for _, evs_ in labelled for ev in evs_]
 
 
+def certificate_single_heat_row_specification(certificate):
+    """Read complete specification evidence bound to one certificate heat row.
+
+    Inventory-wide grade/diameter lists and inspection values cannot supply
+    this stronger numeric-heat constraint. Each participating observation
+    must belong to the same unique heat row and retain its source polygon.
+    """
+    from .filling import GRADE, compact, diameter_text
+    heats = {norm(value) for value in certificate.get('heat_lots', []) if heat_valid(value)}
+    observations = [o for o in certificate.get('field_observations', [])
+                    if o.get('accepted') is not False]
+
+    def value(observation):
+        return observation.get('normalized_value') or observation.get('raw_value')
+
+    def row_id(observation):
+        return observation.get('row_id') or (observation.get('value_evidence') or {}).get('row_id')
+
+    heat_observations = [o for o in observations if o.get('field') == 'heat_lot_no']
+    rows = {row_id(o) for o in heat_observations}
+    if (len(heats) != 1 or not heat_observations or len(rows) != 1 or None in rows or
+            any(norm(value(o)) not in heats for o in heat_observations)):
+        return '', '', []
+    heat_row = next(iter(rows))
+    local = [o for o in observations if row_id(o) == heat_row and
+             o.get('field') in ('heat_lot_no', 'grade', 'diameter_mm')]
+    if any(not (o.get('value_evidence') or {}).get('polygon_page') or
+           (o.get('value_evidence') or {}).get('page_no') not in (None, certificate['page_no'])
+           for o in local):
+        return '', '', []
+    grade_observations = [o for o in local if o.get('field') == 'grade']
+    diameter_observations = [o for o in local if o.get('field') == 'diameter_mm']
+    grades = {norm(value(o)) for o in grade_observations}
+    diameters = {diameter_text(value(o)) for o in diameter_observations}
+    if (len(grades) != 1 or not all(GRADE.fullmatch(compact(grade)) for grade in grades) or
+            len(diameters) != 1 or None in diameters):
+        return '', '', []
+    locations = []
+    for observation in local:
+        ev = deepcopy(observation['value_evidence'])
+        ev.update(page_no=certificate['page_no'], source_role='certificate',
+                  candidate_id=certificate['candidate_id'], row_id=heat_row,
+                  field=observation['field'], method='certificate_single_heat_row_specification')
+        if ev not in locations:
+            locations.append(ev)
+    return next(iter(grades)), next(iter(diameters)), locations
+
+
 def certificate_heat_conflicts(record, certificate, peers, plate_info, page):
     """Recall heat-conflict evidence, never an automatic association.
 
     Complete grade/specification queries retain their existing conflict
     candidates. If exactly one nameplate has a single-letter heat difference
     from the uniquely identified certificate, the caller may use that plate
-    as an association while preserving this contradiction for review. If the
+    as an association while preserving this contradiction for review. A
+    single-digit difference additionally requires complete, equal grade and
+    diameter evidence from the certificate heat row and the nameplate. If the
     grade is unreadable, an independently equal diameter can still locate the
     candidate; this partial query never supplies a grade.
     """
     cert_heats = sorted({norm(v) for v in certificate.get('heat_lots', []) if heat_valid(v)})
     grade, diameter, query_locations = certificate_conflict_query(record, certificate, page)
+    row_grade, row_diameter, row_specification_locations = certificate_single_heat_row_specification(certificate)
     if not cert_heats:
         return []
     certificate_numbers = {certificate_number(v) for v in certificate.get('certificate_numbers', [])}
@@ -420,15 +471,20 @@ def certificate_heat_conflicts(record, certificate, peers, plate_info, page):
         plate_heats = sorted({norm(v) for v in plate.get('heat_lots', []) if heat_valid(v)})
         if not plate_heats or set(cert_heats) & set(plate_heats):
             continue
+        equal_certificate_row_specification = bool(
+            row_grade and row_diameter and observed_grade == row_grade and observed_diameter and
+            same_number(row_diameter, observed_diameter))
         heat_differences = [difference
             for certificate_heat in cert_heats
             for nameplate_heat in plate_heats
-            if (difference := single_heat_difference(certificate_heat, nameplate_heat))]
+            if (difference := single_heat_difference(certificate_heat, nameplate_heat,
+                                allow_numeric=equal_certificate_row_specification))]
+        numeric_difference = any(item.get('difference_type') == 'digit' for item in heat_differences)
         complete_keywords = bool(grade and diameter and observed_grade == grade and observed_diameter and
                                  same_number(diameter, observed_diameter))
         equal_known_diameter = bool(entry_diameter and observed_diameter and
                                     same_number(entry_diameter, observed_diameter))
-        if not complete_keywords and not (
+        if not complete_keywords and not numeric_difference and not (
                 equal_known_diameter and heat_differences and len(certificate_numbers) == 1 and
                 not unbound_grade_label):
             continue
@@ -441,28 +497,34 @@ def certificate_heat_conflicts(record, certificate, peers, plate_info, page):
         for ev in plate_locations:
             ev.setdefault('page_no', plate['page_no'])
             ev.update(source_role='nameplate', candidate_id=plate['candidate_id'])
-        keyword_description = '同规格牌号' if complete_keywords else '已知规格一致、牌号未完整确认的'
+        keyword_description = ('证书炉批行规格牌号一致的' if numeric_difference else
+                               ('同规格牌号' if complete_keywords else '已知规格一致、牌号未完整确认的'))
         reason = (f'质量证明书第{certificate["page_no"]}页炉批号 {"、".join(cert_heats)} 与{keyword_description}'
                   f'铭牌第{plate["page_no"]}页炉批号 {"、".join(plate_heats)} 不一致；'
                   '保留异常候选，未自动匹配或改写字符')
         if query_locations:
             reason += f'；查询牌号 {grade} 取自该证书单炉批的明确牌号标签，未补写进场记录'
-        # A one-letter OCR substitution (for example CE2603337 vs
-        # CB2603337) can identify a unique association, but must not rewrite
-        # either source value. Keep the exact differing positions alongside
-        # the page/ROI evidence below.
+        numeric_locations = row_specification_locations if numeric_difference else []
+        if numeric_difference:
+            reason += f'；证书同炉批行牌号 {row_grade}、直径 {row_diameter} 与铭牌完整一致'
+        # A one-character substitution can locate an association under the
+        # corresponding keyword constraints, but never rewrites either
+        # source value. Keep the differing positions with the source evidence.
         if heat_differences:
             descriptions = '；'.join(item['description'] for item in heat_differences)
-            reason += ('；检测到炉批号仅有单个字母差异（' + descriptions + '），'
+            difference_label = '数字' if numeric_difference else '字母'
+            reason += (f'；检测到炉批号仅有单个{difference_label}差异（' + descriptions + '），'
                        '可能是OCR字符误识别；仅保留候选，需人工核验')
         candidates.append(dict(kind='certificate_nameplate_heat_conflict', nameplate=plate,
             certificate=certificate, certificate_heat_lots=cert_heats, nameplate_heat_lots=plate_heats,
-            query_grade=grade, query_diameter_mm=diameter or entry_diameter,
-            query_source=('certificate_single_heat_label' if query_locations else
-                          ('inspection' if complete_keywords else 'inspection_partial_keywords')),
-            reason=reason, locations=deepcopy(cert_locations + plate_locations),
+            query_grade=row_grade if numeric_difference else grade,
+            query_diameter_mm=row_diameter if numeric_difference else diameter or entry_diameter,
+            query_source=('certificate_single_heat_row' if numeric_difference else
+                          ('certificate_single_heat_label' if query_locations else
+                          ('inspection' if complete_keywords else 'inspection_partial_keywords'))),
+            reason=reason, locations=deepcopy(cert_locations + numeric_locations + plate_locations),
             heat_lot_differences=heat_differences,
-            heat_lot_review_locations=deepcopy(cert_locations + plate_locations),
+            heat_lot_review_locations=deepcopy(cert_locations + numeric_locations + plate_locations),
             review_only=True, write_allowed=False,
             association_status='candidate_only'))
     return candidates
@@ -522,11 +584,11 @@ def build_automatic_ledger(result, index, catalog, records):
             dr, mode, headers = delivery_choices(plate, pi, all_rows, deliveries, peers)
             options.append(dict(plate=plate, certificates=linked, delivery_rows=dr,
                                 delivery_mode=mode, delivery_headers=headers))
-        # A single letter-level heat discrepancy can be used as an association
+        # A constrained single-character discrepancy can establish an association
         # only when it identifies exactly one physical nameplate. We still
         # preserve both OCR values and emit a blocking-for-review diagnostic;
         # ambiguous candidates remain unselected.
-        # A fuzzy one-letter fallback is safe only when the certificate has
+        # A near-heat fallback is safe only when the certificate has
         # one heat and no exact-heat nameplate exists.  If an exact heat card
         # is present but rejected for a keyword/boundary conflict, keep that
         # contradiction for review instead of replacing it with another card.
@@ -549,12 +611,17 @@ def build_automatic_ledger(result, index, catalog, records):
                     norm(heat_info.get('value')) == conflict['nameplate_heat_lots'][0]):
                 dr, mode, headers = delivery_choices(plate, pi, all_rows, deliveries, peers)
                 associated = deepcopy(conflict)
+                numeric_difference = conflict['heat_lot_differences'][0].get('difference_type') == 'digit'
+                association_method = ('unique_single_digit_heat_difference_equal_specification' if numeric_difference
+                                      else 'unique_single_letter_heat_difference')
+                association_reason = ('已按唯一单数字差异和证书铭牌同规格自动关联' if numeric_difference
+                                      else '已按唯一单字母差异自动关联')
                 associated.update(review_only=False, write_allowed=True,
                                   association_status='auto_matched_with_heat_conflict',
-                                  association_method='unique_single_letter_heat_difference')
+                                  association_method=association_method)
                 associated['reason'] = associated['reason'].replace(
                     '保留异常候选，未自动匹配或改写字符',
-                    '已按唯一单字母差异自动关联，台账采用铭牌炉批号原文；与质量证明书存在矛盾，待人工核验'
+                    association_reason + '，台账采用铭牌炉批号原文；与质量证明书存在矛盾，待人工核验'
                 ).replace('仅保留候选，需人工核验', '已关联但未改写双方OCR原文，需人工核验')
                 options = [dict(plate=plate, certificates=[direct[0]], delivery_rows=dr,
                                 delivery_mode=mode, delivery_headers=headers,
@@ -634,12 +701,12 @@ def build_automatic_ledger(result, index, catalog, records):
                     heat_lot_differences=deepcopy(conflict.get('heat_lot_differences', [])),
                     heat_lot_review_locations=deepcopy(conflict.get('heat_lot_review_locations', [])),
                     association_status='auto_matched_with_heat_conflict',
-                    association_method='unique_single_letter_heat_difference',
+                    association_method=conflict['association_method'],
                     written_heat_lot=next(iter(conflict['nameplate_heat_lots']), ''))
                 info.setdefault('heat_lot_no', field())
                 info['heat_lot_no'].setdefault('diagnostics', []).append(issue)
                 sources['nameplate'] = dict(plate,
-                    association_method='unique_single_letter_heat_difference',
+                    association_method=conflict['association_method'],
                     certificate_heat_lots=deepcopy(conflict['certificate_heat_lots']),
                     nameplate_heat_lots=deepcopy(conflict['nameplate_heat_lots']))
             for key in ('manufacturer', 'heat_lot_no', 'specification'):
@@ -861,7 +928,7 @@ def build_automatic_ledger(result, index, catalog, records):
         rows.append(dict(record_id=r['record_id'], fields=fields, match_route=p['route'],
             match_path=path, matched_heat_lots=matched_heats,
             match_status=match_status,
-            diagnostics=issues, match_candidates=alternatives, sources=sources, reviewed=False,
+            diagnostics=issues, match_candidates=deepcopy(alternatives), sources=deepcopy(sources), reviewed=False,
             duplicate_record_ids=deepcopy(r.get('duplicate_record_ids', [])),
             duplicate_source_records=deepcopy(r.get('duplicate_source_records', []))))
     # Every diagnostic/candidate retains its own source pixel axes, including approval crops.
